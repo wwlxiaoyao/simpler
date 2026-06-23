@@ -33,13 +33,20 @@ available.
   `l2_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into
-  `complete` / `dispatch`. Idle iterations no longer emit a record
-  on a2a3; the host tooling reconstructs idle spans from the gap
-  between consecutive work records on the same thread. Legacy
-  captures (and a5) may still carry `scan` / `idle` records — both
-  are silently dropped by the parser (idle is double-painted
-  by the gap reconstruction; `scan` was never emitted in a2a3).
+- **AICPU scheduler phases** — per-iteration breakdown into six
+  mutually time-exclusive **outer** phases (`complete` / `dispatch`
+  / `release` / `wire` / `dummy` / `early_dispatch`), one **inner**
+  phase that nests inside its parent outer (`resolve`, parent =
+  Complete or Dummy), and one **separate-lane** phase
+  (`dummy_task`, rendered on Worker View AICPU_N rather than on the
+  sched lane). Idle iterations no longer emit a record on a2a3; the
+  host tooling reconstructs idle spans from the gap between
+  consecutive work records on the same thread. See §3.2 for the
+  full per-phase table. Legacy captures may carry `scan` / `poll` /
+  `idle` / `fanout` / `prestage` — current a2a3 builds no longer
+  emit them (PR #1079's Scan/Poll debug overlay was removed;
+  Fanout was renamed Resolve and now also filters out <1 µs walks;
+  Prestage was renamed EarlyDispatch).
 - **Orchestrator submit envelope** — one record per `submit_task()`
   / `alloc_tensors()` call covering the whole submit's
   `[start, end]` window (`orch_submit` phase). Per-sub-step
@@ -128,17 +135,74 @@ runs):
 Filenames are fixed (no per-file timestamp) — the directory is the
 per-task uniqueness boundary.
 
-`l2_swimlane_records.json` carries the raw records — this is the file
-you pass to `swimlane_converter`. Important fields per task:
+`l2_swimlane_records.json` carries the raw records. **There are two
+layers to be aware of:**
+
+- **On-disk (raw, cycle domain).** What the host writes. Compact —
+  per-stream tuples plus a small metadata block. Anyone reading the
+  file directly with `json.load` sees this shape and only this shape.
+- **Reader output (joined, µs domain).**
+  `swimlane_converter.read_perf_data()` joins the on-disk streams, fills
+  in `core_type` / `core_to_thread`, converts cycles to microseconds
+  using `metadata.clock_freq_hz`, and returns the joined dict that every
+  downstream consumer (Perfetto converter, `sched_overhead_analysis`,
+  `deps_viewer`, in-test validator) reads. Always go through
+  `read_perf_data`; never load `l2_swimlane_records.json` with raw
+  `json.load` from new code.
+
+#### On-disk schema
+
+```jsonc
+{
+  "l2_swimlane_level": <1..4>,
+
+  // Everything the python reader needs that isn't a per-record stream.
+  "metadata": {
+    "clock_freq_hz": <int>,            // cycle→µs factor. a2a3=50e6, a5=1e9.
+    "num_cores": <int>,                // == len(core_types)
+    "core_types": ["aic"|"aiv", ...],  // indexed by core_id
+    "core_to_thread": [<int>, ...]     // optional; level >= 3 only
+  },
+
+  // Bulk task streams — flat array of tuples. Column order is fixed.
+  //   aicore_tasks: [core_id, task_token_raw, reg_task_id,
+  //                  start_cycles, end_cycles]
+  //   aicpu_tasks:  [core_id, reg_task_id,
+  //                  dispatch_cycles, finish_cycles]
+  "aicore_tasks": [[...], ...],
+  "aicpu_tasks":  [[...], ...],
+
+  // Per-scheduler-thread arrays of objects (level >= 3 only).
+  //   sched record: {kind, start_cycles, end_cycles, loop_iter,
+  //                  tasks_processed, [pop_hit, pop_miss]}
+  //   orch record:  {submit_idx, task_id, start_cycles, end_cycles}
+  // pop_hit / pop_miss are present only on Dispatch records.
+  "aicpu_scheduler_phases":    [ [ {...}, ... ], ... ],
+  "aicpu_orchestrator_phases": [ [ {...}, ... ], ... ]   // level >= 4 only
+}
+```
+
+All timestamps on disk are raw `get_sys_cnt` cycles (uint64). The
+join key between `aicore_tasks` and `aicpu_tasks` is
+`(core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
+`block_num > num_cores` and MIX cluster spread can dispatch the same
+`task_token_raw` to the same core multiple times. AICore is the
+canonical producer of `task_token_raw`; AICPU only stamps the
+dispatch / finish timestamps and the per-core join token.
+
+#### Reader output (µs domain)
+
+After `read_perf_data()` joins the streams and converts to
+microseconds, downstream code sees:
 
 | Field | Meaning |
 | ----- | ------- |
 | `task_id` | Runtime task id (`(ring_id << 32) \| local_id`); also exposed split as`ring_id` |
-| `func_id` | Kernel function id |
+| `func_id` | Kernel function id. Always `-1` on disk; resolved post-process from `deps.json::tasks[].kernel_ids[3]` (see `swimlane_converter.resolve_func_id_from_kernel_map`) |
 | `core_id` / `core_type` | Physical core index and `"aic"` / `"aiv"` string |
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
-| `dispatch_time_us` | AICPU timestamp when this task was dispatched (filled at level >= 2) |
-| `finish_time_us` | AICPU timestamp when AICPU observed FIN (filled at level >= 2) |
+| `dispatch_time_us` | AICPU timestamp when this task was dispatched (filled at level >= 2; `0.0` at level 1) |
+| `finish_time_us` | AICPU timestamp when AICPU observed FIN (filled at level >= 2; `0.0` at level 1) |
 
 Note: per-task records carry **no** fanout edges. Dependency arrows
 come from a separate `deps.json` (dep_gen) joined at convert time —
@@ -150,15 +214,47 @@ Phase records (per scheduler thread, level >= 3 for
 
 | Field | Meaning |
 | ----- | ------- |
-| `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds |
-| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` (`scan` / `idle` may appear in legacy captures and a5; both are dropped by the parser). Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
+| `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |
+| `phase` | Lowercase phase name. Scheduler: see the table below. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
-| `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field |
+| `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field (see per-phase table) |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
+
+Scheduler phase taxonomy — three role classes share one `phase`
+field but render differently in Perfetto:
+
+| Phase | Role | Lane | `tasks_processed` semantic |
+| ----- | ---- | ---- | -------------------------- |
+| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
+| `dispatch` | outer | sched | subtasks published this iter |
+| `release` | outer | sched | deferred-release slots drained this iter |
+| `wire` | outer | sched | tasks wired by `drain_wiring_queue` this iter |
+| `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
+| `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
+| `resolve` | inner | sched (nests in `complete` or `dummy`) | consumers visited in `on_task_complete` |
+| `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | dummy `task_id` low 32 bits (deps.json flow target) |
+
+Outer phases are mutually time-exclusive within an iter — each
+emit advances the per-thread phase anchor (`_t0_phase`). Inner
+phases (`resolve`) don't advance the anchor; Perfetto nests them
+under the parent outer bar via time containment. Separate-lane
+phases are routed to a different lane by the converter (Worker
+View AICPU_N), so they never overlap visually with the sched
+lane bars even when their timestamps fall inside an outer span.
+
+Legacy phases (`scan` / `poll` / `idle` / `fanout` / `prestage`)
+are still parsed for old captures but current a2a3/a5 builds no
+longer emit them. Renames: `fanout` → `resolve`, `prestage` →
+`early_dispatch`. Removed: Scan/Poll (PR #1079 debug overlay).
+
+On disk the sched records carry a `kind` field (string-encoded
+phase name); the reader renames it to `phase` so downstream code
+can keep a single discriminator name.
 
 `core_to_thread[]` (level >= 3) maps `core_id` (array index) to the
 scheduler thread index that retired that core's tasks (`-1` =
-unassigned).
+unassigned). On disk it lives under `metadata.core_to_thread`; the
+reader hoists it to the top of the output dict.
 
 ### 3.3 Convert and view in Perfetto
 
@@ -183,14 +279,40 @@ The output is `outputs/<case>_<ts>/merged_swimlane.json` (or your
 `-o` override). Open <https://ui.perfetto.dev/> and drag the file
 in. The trace contains:
 
-- **AICore View** — one swim-lane per AICore (AIC / AIV / mix
-  channel). Each task shows `func_name(t<task_id>)`; dependency
-  arrows are joined from `deps.json` when it's available — see
-  [§3.5](#35-dependency-arrows-from-dep_gen) for the workflow. No
-  `deps.json` → no arrows (the converter prints a one-line hint).
-- **AICPU View** — scheduler thread lanes with per-iteration
-  phase blocks coloured by `phase`.
-- **AICPU Scheduler** — orchestrator phase summary at the top.
+- **Orchestrator** (pid=1) — per-submit `orch_submit` envelope
+  blocks (level >= 4).
+- **AICPU Scheduler** (pid=2) — per-iteration scheduler phase
+  blocks coloured by `phase` (level >= 3). The six outer phases
+  (`complete` / `dispatch` / `release` / `wire` / `dummy` /
+  `early_dispatch`) appear as sibling bars on each scheduler
+  thread's lane; the `resolve` inner phase nests inside its
+  parent (`complete` or `dummy`).
+- **Scheduler View** (pid=3) — task-execution overlay using AICPU
+  dispatch/finish timestamps (level >= 2), with the same labels
+  as Worker View.
+- **Worker View** (pid=4) — one swim-lane per physical worker:
+  - `AIC_N` — matrix cores (kernel exec from level >= 1)
+  - `AIV_N` — vector cores (kernel exec from level >= 1)
+  - `AICPU_N` — AICPU acting as worker; carries `dummy_task`
+    zero-width markers (one per dummy drained by the sched
+    thread on AICPU N) and `alloc` bars (from `alloc_tensors()`
+    calls that the orchestrator on AICPU 0 inline-completed).
+    Both are activities the AICPU performs as a worker, so they
+    share the same lane tier as AIC/AIV.
+
+**Task labeling (AICore View and AICPU View) depends entirely on
+whether a `deps.json` is present** (see
+[§3.5](#35-dependency-arrows-from-dep_gen)):
+
+- **With `deps.json`** — each task shows `func_name(rXtY)` (or
+  `func_<id>(rXtY)` when no name map), and dependency arrows are
+  drawn in the AICore View.
+- **Without `deps.json`** — the host never records `func_id` (it's
+  `-1` on disk), so the converter cannot tell tasks apart by
+  function. Every task in **both** views is labeled `task(rXtY)` —
+  distinguished only by id — and no arrows are drawn (the converter
+  prints a one-line hint). Re-run with `--enable-dep-gen` (or join an
+  existing `deps.json`) to recover names and arrows.
 
 When the run also emitted a device log (`device-*` file under
 `outputs/`), `swimlane_converter` resolves the nearest log by
@@ -201,9 +323,18 @@ specific overhead source.
 
 ### 3.4 Adding human-readable names
 
-Without name mapping, tasks show as `func_<id>(t<task_id>)`. To
-get readable lane labels, add a `name` field to your CALLABLE
-spec:
+Lane labels degrade in two steps:
+
+| What's available | Label | Distinguishable? |
+| ---------------- | ----- | ---------------- |
+| No `deps.json` (no `--enable-dep-gen`) | `task(rXtY)` | By id only — `func_id` is unresolved |
+| `deps.json`, no name map | `func_<id>(rXtY)` | By function id |
+| `deps.json` + name map | `QK(rXtY)` | By human name |
+
+So a readable trace needs **both** a `deps.json` (to resolve
+`func_id`; see [§3.5](#35-dependency-arrows-from-dep_gen)) **and** a
+name map. To get readable lane labels, add a `name` field to your
+CALLABLE spec:
 
 ```python
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -283,6 +414,35 @@ Use this when:
   (one `dep_gen` capture amortizes across N swimlane runs).
 - A workload is so large that the dep_gen replay validation gate
   would dominate the swimlane run time.
+
+**Low-distortion workflow (minimal capture, names recovered
+offline):** When you want the least possible perturbation — skip the
+`dep_gen` replay overhead on the measured run, and/or use a low
+swimlane perf_level (e.g. level 1, AICore timing only) — run the perf
+capture *without* `--enable-dep-gen`. The resulting trace labels every
+task `task(rXtY)` (no `func_id`, no arrows). To recover names and
+arrows afterward, take a `deps.json` from a separate `dep_gen` capture
+of the same topology, drop it next to your `l2_swimlane_records.json`
+(or point `--deps-json` at it), and re-run the converter:
+
+```bash
+# Low-overhead perf run — no dep_gen, low level.
+python test_my_case.py --platform a2a3 --enable-l2-swimlane 1
+
+# Separately (once per topology), capture the graph.
+python test_my_case.py --platform a2a3 --enable-dep-gen
+
+# Join offline: copy the deps.json in, then re-run the converter.
+cp outputs/<case_dep_ts>/deps.json outputs/<case_perf_ts>/deps.json
+python -m simpler_setup.tools.swimlane_converter \
+    outputs/<case_perf_ts>/l2_swimlane_records.json \
+    --func-names outputs/<case_perf_ts>/name_map_<case>.json
+```
+
+The converter is a pure post-processor — re-running it against the
+same raw records with a `deps.json` now present upgrades the labels
+from `task(rXtY)` to real names and adds the dependency arrows,
+without re-running the workload.
 
 When `--deps-json` is omitted **and** the converter cannot find a
 sibling `deps.json` next to `l2_swimlane_records.json`, the trace is
@@ -440,7 +600,7 @@ bounded only by how fast the host drains — not by the per-core buffer
 sum.
 
 **Measured impact.** Hardware bench on a2a3 paged_attention_unroll
-Case1 with swimlane=4: rotation design delivers sched −4 µs / orch −19 µs
+Case1 with swimlane=4: rotation design delivers sched -4 µs / orch -19 µs
 vs the upstream/main baseline, comparable to the no-rotation predecessor
 (which had this PR's earlier commit; the rotation adds about 3 µs
 sched overhead per session as price for unbounded session length).
@@ -765,9 +925,17 @@ did not, run it manually:
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
 ```
 
-**Tasks show as `func_<id>` instead of human names.** The
-CALLABLE spec lacks `"name"` fields, or
-`name_map_<case>.json` was not produced. See [profiling-name-map.md](../profiling-name-map.md).
+**All tasks show as `task(rXtY)` (undistinguished).** No `deps.json`
+was available, so the converter could not resolve `func_id` (it's
+`-1` on disk) and every lane falls back to the anonymous `task(rXtY)`
+label with no dependency arrows. Re-run with `--enable-dep-gen`, or
+drop a `deps.json` from a prior `dep_gen` capture next to the records
+and re-run the converter — see
+[§3.5](#35-dependency-arrows-from-dep_gen).
+
+**Tasks show as `func_<id>` instead of human names.** `deps.json`
+resolved the `func_id`, but the CALLABLE spec lacks `"name"` fields
+or `name_map_<case>.json` was not produced. See [profiling-name-map.md](../profiling-name-map.md).
 
 **Some tasks missing from the swimlane.** Likely dropped on device
 because the buffer pool ran out. On a2a3 check
@@ -807,6 +975,11 @@ rules.
 
 ## 9. Related docs
 
+- [l2-timing.md](l2-timing.md) — the everyday L2 numbers: `RunTiming`
+  host_wall / device_wall, plus Total / Orch / Sched straight from the
+  `PTO2_PROFILING` device-log markers (no swimlane capture, works with
+  `--rounds > 1`); the lighter alternative when you don't need the
+  per-task / phase deep dive.
 - [profiling-framework.md](../profiling-framework.md) — shared
   host-side collector framework (a2a3 only).
 - [profiling-name-map.md](../profiling-name-map.md) — `func_id` →

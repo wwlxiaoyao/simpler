@@ -37,7 +37,6 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
-#include <unordered_set>
 
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
@@ -65,6 +64,8 @@ int ScopeStatsCollector::init(
     num_threads_ = num_threads;
     total_collected_ = 0;
     records_.clear();
+    recovered_current_buf_ = 0;
+    recovered_current_total_ = 0;
     execution_complete_.store(false, std::memory_order_release);
 
     // Stash callbacks on the base up-front so alloc_paired_buffer sees
@@ -175,6 +176,9 @@ bool ScopeStatsCollector::reconcile_counters() {
     bool clean = true;
 
     ScopeStatsBufferState *state = scope_stats_state(0);
+    uint64_t total_device = state->total_record_count;
+    uint64_t dropped_device = state->dropped_record_count;
+
     uint64_t buf_dev = state->current_buf_ptr;
     if (buf_dev != 0) {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
@@ -182,17 +186,32 @@ bool ScopeStatsCollector::reconcile_counters() {
             profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(ScopeStatsBuffer));
             uint32_t count = reinterpret_cast<const ScopeStatsBuffer *>(host_ptr)->count;
             if (count != 0) {
-                LOG_ERROR(
-                    "scope_stats reconcile: un-flushed buffer (current_buf_ptr=0x%lx, count=%u) — device flush failed",
-                    static_cast<unsigned long>(buf_dev), count
-                );
+                if (recovered_current_buf_ != buf_dev || recovered_current_total_ != total_device) {
+                    append_buffer_records(host_ptr);
+                    recovered_current_buf_ = buf_dev;
+                    recovered_current_total_ = total_device;
+                    LOG_WARN(
+                        "scope_stats reconcile: recovered un-flushed buffer "
+                        "(current_buf_ptr=0x%lx, count=%u) host-side; device flush did not run",
+                        static_cast<unsigned long>(buf_dev), count
+                    );
+                } else {
+                    LOG_WARN(
+                        "scope_stats reconcile: un-flushed buffer "
+                        "(current_buf_ptr=0x%lx, count=%u) was already recovered host-side",
+                        static_cast<unsigned long>(buf_dev), count
+                    );
+                }
                 clean = false;
             }
+        } else {
+            LOG_ERROR(
+                "scope_stats reconcile: un-flushed buffer current_buf_ptr=0x%lx has no host mapping",
+                static_cast<unsigned long>(buf_dev)
+            );
+            clean = false;
         }
     }
-
-    uint64_t total_device = state->total_record_count;
-    uint64_t dropped_device = state->dropped_record_count;
 
     if (dropped_device > 0) {
         LOG_WARN(
@@ -244,24 +263,28 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     const ScopeStatsDataHeader *hdr = scope_stats_header();
     const ScopeStatsBufferState *state = scope_stats_state(0);
 
-    // Line 1: run metadata. The per-ring maxima (task window / heap capacities)
-    // and the tensormap capacity are run-constants, so they live here once
-    // rather than on every record.
+    // Line 1: run metadata. Per-ring capacities and the tensormap capacity are
+    // run-constants, so they live here once rather than on every record.
     std::string task_window_max;
     std::string heap_max;
+    std::string dep_pool_max;
     for (int r = 0; r < PTO2_SCOPE_STATS_MAX_RING_DEPTH; r++) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->task_window_cap[r]);
         task_window_max += buf;
         std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", hdr->heap_cap[r]);
         heap_max += buf;
+        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->dep_pool_cap[r]);
+        dep_pool_max += buf;
     }
     std::fprintf(
         fp,
-        "{\"version\": 4, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
-        "\"task_window_max\": [%s], \"heap_max\": [%s], \"tensormap_max\": %d}\n",
+        // version 6: heap_start/heap_end are monotonic cumulative bytes (was
+        // wrapping ring offsets in v5) — see docs/dfx/scope-stats.md.
+        "{\"version\": 6, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
+        "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d}\n",
         hdr->fatal_latched ? "true" : "false", state->dropped_record_count, state->total_record_count,
-        task_window_max.c_str(), heap_max.c_str(), hdr->tensormap_cap
+        task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), hdr->tensormap_cap
     );
 
     // Serialize every record into one in-memory buffer, then a single fwrite.
@@ -269,8 +292,8 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     // parsing + per-call FILE locking on ~6×N calls was the dominant host cost.
     std::scoped_lock lock(records_mutex_);
     std::string out;
-    out.reserve(records_.size() * 128);
-    char line[320];
+    out.reserve(records_.size() * 384);
+    char line[512];
     for (const ScopeStatsRecord &rec : records_) {
         const int site_len = static_cast<int>(strnlen(rec.site_file_basename, sizeof(rec.site_file_basename)));
         const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" : "end";
@@ -279,9 +302,10 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
             "{\"site\": \"%.*s:%d\", \"phase\": \"%s\", \"depth\": %d, \"ring\": %d, "
             "\"task_window_start\": %d, \"task_window_end\": %d, "
             "\"heap_start\": %" PRIu64 ", \"heap_end\": %" PRIu64 ", "
+            "\"dep_pool_start\": %d, \"dep_pool_end\": %d, "
             "\"tensormap\": %d}\n",
             site_len, rec.site_file_basename, rec.site_line, phase, rec.depth, rec.ring_id, rec.task_start,
-            rec.task_end, rec.heap_start, rec.heap_end, rec.tensormap_used
+            rec.task_end, rec.heap_start, rec.heap_end, rec.dep_pool_start, rec.dep_pool_end, rec.tensormap_used
         );
         if (n > 0) out.append(line, static_cast<size_t>(n < static_cast<int>(sizeof(line)) ? n : sizeof(line) - 1));
     }
@@ -309,6 +333,8 @@ void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, c
         records_.clear();
         records_.shrink_to_fit();
     }
+    recovered_current_buf_ = 0;
+    recovered_current_total_ = 0;
 
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);

@@ -13,7 +13,7 @@ pytest: ``pytest --platform a2a3sim``
 standalone: ``python test_xxx.py -p a2a3sim``
 
 A scene test class declares three things:
-  CALLABLE: what to compile/register
+  CALLABLE: what to compile/prepare
     L2: orchestration (C++ source) + incores (C++ kernels)
     L3: orchestration (Python DAG fn) + callables (ChipCallable + SubCallable)
   CASES: how to run (per-case platform, config, params)
@@ -173,13 +173,13 @@ class TaskArgsBuilder:
 
 
 class CallableNamespace:
-    """Dot-access container for compiled/registered callables.
+    """Dot-access container for compiled/prepared callables.
 
     Used by L3 orch functions to access callables by name::
 
         callables.vector_kernel       # → ChipCallable object
         callables.vector_kernel_sig   # → signature list
-        callables.verify              # → callable_id (int)
+        callables.verify              # → CallableHandle
 
     Also provides ``keep()`` for lifetime management: L3 orch functions
     that build transient Python objects (e.g. ChipStorageTaskArgs) whose
@@ -388,6 +388,106 @@ def _log_round_timings(timings):
         print(msg)
 
 
+def _get_device_log_dir(device_id) -> Path:
+    """Return the CANN device log directory for *device_id*.
+
+    Delegates to ``device_log_resolver.get_log_root`` so the log-relocation env
+    vars (ASCEND_PROCESS_LOG_PATH / ASCEND_WORK_PATH) are honored in one place.
+    """
+    from .tools.device_log_resolver import get_log_root  # noqa: PLC0415
+
+    return get_log_root() / f"device-{device_id}"
+
+
+def _snapshot_time() -> int:
+    """Record current time as a baseline for detecting device logs written after this point."""
+    import time  # noqa: PLC0415
+
+    return time.time_ns()
+
+
+def _snapshot_log_offsets(log_dir: Path) -> dict[str, int]:
+    """Byte size of each existing ``*.log`` in *log_dir*, keyed by path string.
+
+    Lets the post-run parser read only the bytes this run appends, so blocks an
+    earlier case wrote into the same (reused-process) log file are not counted.
+    """
+    offsets: dict[str, int] = {}
+    if log_dir.exists():
+        for p in log_dir.glob("*.log"):
+            try:
+                offsets[str(p)] = p.stat().st_size
+            except FileNotFoundError:
+                continue
+    return offsets
+
+
+def _print_device_log_timing(device_id, before_time, baseline_offsets, expected_rounds, timeout=20.0):
+    """Read the freshest device log and print per-round Total / Orch / Sched.
+
+    Driven by ``--enable-device-log-timing``. The orch/sched ``LOG_INFO_V9``
+    markers are emitted every round by ``PTO2_PROFILING`` (default-on, and
+    independent of ``--enable-l2-swimlane``), so this works for any ``--rounds``
+    count — unlike the swimlane-backed device column in ``_log_round_timings``,
+    which only captures round 0 when ``--rounds > 1``.
+
+    CANN flushes the device log asynchronously, so this polls until the fresh
+    logs both exist (mtime past ``before_time``) and carry at least
+    ``expected_rounds`` timing blocks, rather than reading once and racing the
+    flush. CANN also rotates the log at 20 MB, so a long run's blocks may span
+    several files; all files written after ``before_time`` are read in mtime
+    order, not just the newest. ``baseline_offsets`` (from ``_snapshot_log_offsets``)
+    caps each pre-existing file's read to the bytes appended after the run began.
+    """
+    import time  # noqa: PLC0415
+
+    from .tools.device_log_timing import format_device_log_timing, parse_device_log_timing  # noqa: PLC0415
+
+    if os.environ.get("ASCEND_SLOG_PRINT_TO_STDOUT") == "1":
+        logger.warning(
+            "device-log timing: ASCEND_SLOG_PRINT_TO_STDOUT=1 routes CANN logs to stdout, not to a "
+            "device log file — the orch/sched timing markers are in the run output above, not parseable here."
+        )
+        return
+
+    log_dir = _get_device_log_dir(device_id)
+    deadline = time.monotonic() + timeout
+    fresh: list[Path] = []
+    rounds = []
+    while time.monotonic() < deadline:
+        if log_dir.exists():
+            # stat() once per file, skipping any that vanish mid-scan from log
+            # rotation (the case this reader handles), then sort on the cached mtime.
+            paths_with_mtime = []
+            for p in log_dir.glob("*.log"):
+                try:
+                    mtime = p.stat().st_mtime_ns
+                except FileNotFoundError:
+                    continue
+                if mtime > before_time:
+                    paths_with_mtime.append((mtime, p))
+            paths_with_mtime.sort()
+            fresh = [p for _, p in paths_with_mtime]
+            if fresh:
+                rounds = parse_device_log_timing(fresh, offsets=baseline_offsets)
+                if len(rounds) >= expected_rounds:
+                    break
+        time.sleep(0.5)
+
+    if not fresh:
+        logger.warning("device-log timing: no device log written after run under %s", log_dir)
+        return
+    if len(rounds) < expected_rounds:
+        logger.warning(
+            "device-log timing: only %d/%d round blocks flushed within %.0fs (CANN async log lag)",
+            len(rounds),
+            expected_rounds,
+            timeout,
+        )
+    source = fresh[-1] if len(fresh) == 1 else f"{len(fresh)} files under {log_dir}"
+    print(format_device_log_timing(rounds, source=source))
+
+
 def _resolve_callable_paths(cls, cls_dir):
     """Resolve relative source paths in CALLABLE against cls_dir."""
     callable_spec = cls.CALLABLE
@@ -558,7 +658,7 @@ def _build_output_prefix(case_label: str) -> Path:
     """Per-case directory for diagnostic artifacts.
 
     Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
-    runtime writes ``l2_swimlane_records.json``, ``tensor_dump/``, and ``pmu.csv``
+    runtime writes ``l2_swimlane_records.json``, ``args_dump/``, and ``pmu.csv``
     under that root with fixed filenames. Two cases of the same name run in
     the same second is not a contemplated scenario (parallel xdist runs differ
     by class+method).
@@ -579,12 +679,18 @@ def _build_output_prefix(case_label: str) -> Path:
 def _run_swimlane_converter(
     input_path: Path | None = None,
     func_names_path: Path | None = None,
+    enable_overhead: bool = False,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
 
     When ``input_path`` is given, the converter derives its output filename from
     the input's timestamp (see ``swimlane_converter._resolve_output_path``).
     Without it, the converter auto-selects the latest ``l2_swimlane_records_*.json``.
+
+    ``enable_overhead`` forwards the converter's ``--overhead`` flag — adds the
+    8 Overhead Analysis counter tracks (per-engine idle/ready/overhead + system
+    all/has overhead) under the AICPU Scheduler process. Needs deps.json; the
+    converter silently no-ops if deps is absent.
     """
     import logging  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
@@ -595,6 +701,8 @@ def _run_swimlane_converter(
         cmd.append(str(input_path))
     if func_names_path is not None:
         cmd += ["--func-names", str(func_names_path)]
+    if enable_overhead:
+        cmd.append("--overhead")
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
@@ -616,6 +724,7 @@ def _convert_case_swimlane(
     case_label: str,
     output_prefix: Path,
     callable_spec: dict | None = None,
+    enable_overhead: bool = False,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
     just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
@@ -636,12 +745,70 @@ def _convert_case_swimlane(
         safe_label = _sanitize_for_filename(case_label)
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
-    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path)
+    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path, enable_overhead=enable_overhead)
+
+
+def _run_deps_viewer(
+    input_path: Path,
+    func_names_path: Path | None = None,
+) -> None:
+    """Invoke the bundled deps_viewer tool as a subprocess (text mode).
+
+    Produces ``deps_viewer.txt`` next to ``input_path`` by default.
+    """
+    import logging  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    logger = logging.getLogger(__name__)
+    cmd = [sys.executable, "-m", "simpler_setup.tools.deps_viewer", str(input_path), "--format", "text"]
+    if func_names_path is not None:
+        cmd += ["--func-names", str(func_names_path)]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if result.stdout:
+            logger.info(result.stdout)
+        logger.info("deps_viewer text generation completed")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Failed to generate deps_viewer.txt: {e}")
+        if e.stdout:
+            logger.debug(f"stdout: {e.stdout}")
+        if e.stderr:
+            logger.debug(f"stderr: {e.stderr}")
+
+
+def _graph_case_dep_gen(
+    case_label: str,
+    output_prefix: Path,
+    callable_spec: dict | None = None,
+) -> None:
+    """Post-case: invoke deps_viewer on the deps.json the dep-gen host
+    replay just wrote into ``<output_prefix>/deps.json``.
+    """
+    import logging  # noqa: PLC0415
+
+    logger = logging.getLogger(__name__)
+    deps_file = output_prefix / "deps.json"
+    if not deps_file.exists():
+        logger.warning(f"[{case_label}] {deps_file} not produced; skipping deps_viewer")
+        return
+
+    func_names_path = None
+    if callable_spec:
+        safe_label = _sanitize_for_filename(case_label)
+        name_map_path = output_prefix / f"name_map_{safe_label}.json"
+        if name_map_path.exists():
+            func_names_path = name_map_path
+        else:
+            mapping = _extract_name_map(callable_spec)
+            func_names_path = _dump_name_map(mapping, name_map_path)
+
+    _run_deps_viewer(input_path=deps_file, func_names_path=func_names_path)
 
 
 def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
-    """Post-case: turn ``<output_prefix>/scope_stats.jsonl`` into per-ring
-    heap-delta line charts. Path is known a priori from CallConfig.output_prefix.
+    """Post-case: turn ``<output_prefix>/scope_stats/scope_stats.jsonl`` into
+    the self-contained scope_stats HTML report. Path is known a priori from
+    CallConfig.output_prefix.
     """
     import logging  # noqa: PLC0415
 
@@ -670,14 +837,16 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     cases,
     *,
     callable_obj,
-    sub_ids,
+    sub_handles,
     rounds,
     skip_golden,
     enable_l2_swimlane,
-    enable_dump_tensor,
+    enable_dump_args,
     enable_pmu,
     enable_dep_gen,
     enable_scope_stats,
+    enable_device_log_timing=False,
+    enable_swimlane_overhead=False,
 ):
     """Execute a pre-filtered list of cases for one class (layers 5-6).
 
@@ -687,7 +856,20 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    diagnostics_on = enable_l2_swimlane or enable_dump_tensor or enable_pmu or enable_dep_gen or enable_scope_stats
+    diagnostics_on = enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats
+    # device-log timing wraps each case here (not inside _run_and_validate*),
+    # the same way swimlane conversion does — _run_and_validate_l2 is overridden
+    # by some SceneTestCase subclasses, so threading a kwarg through it would
+    # break those overrides. Onboard L2 only; the orch/sched markers don't exist
+    # on sim and an L3 run spans multiple chip logs.
+    dlt_on = (
+        enable_device_log_timing
+        and getattr(cls_inst, "_st_level", None) == 2
+        and not str(worker._config.get("platform", "")).endswith("sim")
+    )
+    dlt_device_id = worker._config.get("device_id", 0)
+    if enable_device_log_timing and getattr(cls_inst, "_st_level", None) == 3:
+        logger.warning("device-log timing is not supported for L3 (multi-chip); ignoring")
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
         # Per-case directory the runtime writes into. Required (non-empty) when
@@ -696,16 +878,18 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         # l2_swimlane_records.json / deps.json), so it pulls output_prefix the
         # same way the other DFX flags do.
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
+        dlt_baseline = _snapshot_time() if dlt_on else None
+        dlt_offsets = _snapshot_log_offsets(_get_device_log_dir(dlt_device_id)) if dlt_on else None
         try:
             cls_inst._run_and_validate(
                 worker,
                 callable_obj,
                 case,
-                sub_ids=sub_ids,
+                sub_handles=sub_handles,
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -713,9 +897,18 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             )
         finally:
             if enable_l2_swimlane:
-                _convert_case_swimlane(case_label, prefix, callable_spec=callable_spec)
+                _convert_case_swimlane(
+                    case_label,
+                    prefix,
+                    callable_spec=callable_spec,
+                    enable_overhead=enable_swimlane_overhead,
+                )
+            if enable_dep_gen:
+                _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
+            if dlt_baseline is not None:
+                _print_device_log_timing(dlt_device_id, dlt_baseline, dlt_offsets, rounds)
 
 
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
@@ -851,7 +1044,7 @@ class SceneTestCase:
 
         Mirrors the ``st_worker`` pytest fixture, which yields a ``Worker``
         (not a raw ``ChipWorker``) — ``_run_and_validate_l2`` is shared by both
-        paths and calls ``worker.register(...)`` / ``worker.run(cid, ...)``,
+        paths and calls ``worker.register(...)`` / ``worker.run(handle, ...)``,
         which only the ``Worker`` wrapper exposes.
         """
         from simpler.worker import Worker  # noqa: PLC0415
@@ -880,7 +1073,7 @@ class SceneTestCase:
         self,
         config_dict,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -896,8 +1089,21 @@ class SceneTestCase:
         # explicitly in their config dict.
         config.block_dim = config_dict.get("block_dim", 0)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
+        # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
+        # nested under the "runtime_env" key. Takes precedence over the
+        # PTO2_RING_* env vars / RUNTIME_ENV.
+        runtime_env = config_dict.get("runtime_env", {})
+        config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
+        config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
+        config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
+        if "ring_task_windows" in runtime_env:
+            config.runtime_env.ring_task_windows = runtime_env["ring_task_windows"]
+        if "ring_heaps" in runtime_env:
+            config.runtime_env.ring_heaps = runtime_env["ring_heaps"]
+        if "ring_dep_pools" in runtime_env:
+            config.runtime_env.ring_dep_pools = runtime_env["ring_dep_pools"]
         config.enable_l2_swimlane = enable_l2_swimlane
-        config.enable_dump_tensor = enable_dump_tensor
+        config.enable_dump_tensor = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
         config.enable_scope_stats = enable_scope_stats
@@ -930,11 +1136,11 @@ class SceneTestCase:
         worker,
         callable_obj,
         case,
-        sub_ids=None,
+        sub_handles=None,
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -948,7 +1154,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -958,12 +1164,12 @@ class SceneTestCase:
             self._run_and_validate_l3(
                 worker,
                 callable_obj,
-                sub_ids or {},
+                sub_handles or {},
                 case,
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -978,7 +1184,7 @@ class SceneTestCase:
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -988,14 +1194,12 @@ class SceneTestCase:
         config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
-        # The L2 entry point is `Worker.run(cid, args, cfg)`.  Reuse the
-        # cid registered by the st_worker fixture / standalone path.  For
-        # first-time callers (worker reused across rounds), `_st_l2_cid`
-        # caches the cid so subsequent runs skip re-registration.
-        cid = getattr(type(self), "_st_l2_cid", None)
-        if cid is None:
-            cid = worker.register(callable_obj)
-            type(self)._st_l2_cid = cid
+        # The L2 entry point is `Worker.run(handle, args, cfg)`. Reuse the
+        # handle registered by the st_worker fixture / standalone path.
+        handle = getattr(type(self), "_st_l2_handle", None)
+        if handle is None:
+            handle = worker.register(callable_obj)
+            type(self)._st_l2_handle = handle
 
         # Build args
         test_args = self.generate_args(params)
@@ -1028,7 +1232,7 @@ class SceneTestCase:
             config = self._build_config(
                 config_dict,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -1036,7 +1240,7 @@ class SceneTestCase:
             )
 
             with _temporary_env(self._resolve_env()):
-                timing = worker.run(cid, chip_args, config=config)
+                timing = worker.run(handle, chip_args, config=config)
             if rounds > 1 and timing is not None:
                 timings.append((timing.host_wall_us, timing.device_wall_us))
 
@@ -1050,12 +1254,12 @@ class SceneTestCase:
         self,
         worker,
         compiled_callables,
-        sub_ids,
+        sub_handles,
         case,
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -1093,7 +1297,7 @@ class SceneTestCase:
                 initial_tensors[name] = getattr(test_args, name).clone()
 
         # Build CallableNamespace: compiled ChipCallables + sub callable IDs
-        ns = CallableNamespace({**compiled_callables, **sub_ids})
+        ns = CallableNamespace({**compiled_callables, **sub_handles})
 
         # Get orch function (plain function from CALLABLE)
         orch_fn = self.CALLABLE["orchestration"]
@@ -1110,7 +1314,7 @@ class SceneTestCase:
             config = self._build_config(
                 config_dict,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -1164,17 +1368,21 @@ class SceneTestCase:
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=0)
-        enable_dump_tensor = request.config.getoption("--dump-tensor", default=0)
+        enable_dump_args = request.config.getoption("--dump-args", default=0)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
+        # device-log timing is cheap (PTO2_PROFILING markers, one block/round)
+        # so unlike the heavy diagnostics it is NOT disabled when --rounds > 1.
+        enable_device_log_timing = request.config.getoption("--enable-device-log-timing", default=False)
+        enable_swimlane_overhead = request.config.getoption("--enable-swimlane-overhead", default=False)
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
                 enable_l2_swimlane = 0
-            if enable_dump_tensor:
-                logger.warning("Dump tensor disabled: --rounds > 1")
-                enable_dump_tensor = 0
+            if enable_dump_args:
+                logger.warning("Dump args disabled: --rounds > 1")
+                enable_dump_args = 0
             if enable_pmu:
                 logger.warning("PMU disabled: --rounds > 1")
                 enable_pmu = 0
@@ -1184,12 +1392,12 @@ class SceneTestCase:
 
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
-        sub_ids = getattr(type(self), "_st_sub_ids", {})
-        # For L3, use pre-registered chip cids instead of raw ChipCallable
+        sub_handles = getattr(type(self), "_st_sub_handles", {})
+        # For L3, use registered chip handles instead of raw ChipCallable
         # objects.
-        chip_cids = getattr(type(self), "_st_chip_cids", {})
-        if self._st_level == 3 and chip_cids:
-            callable_obj = {**chip_cids}
+        chip_handles = getattr(type(self), "_st_chip_handles", {})
+        if self._st_level == 3 and chip_handles:
+            callable_obj = {**chip_handles}
 
         matched = []
         for case in self.CASES:
@@ -1214,14 +1422,16 @@ class SceneTestCase:
             self,
             matched,
             callable_obj=callable_obj,
-            sub_ids=sub_ids,
+            sub_handles=sub_handles,
             rounds=rounds,
             skip_golden=skip_golden,
             enable_l2_swimlane=enable_l2_swimlane,
-            enable_dump_tensor=enable_dump_tensor,
+            enable_dump_args=enable_dump_args,
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
             enable_scope_stats=enable_scope_stats,
+            enable_device_log_timing=enable_device_log_timing,
+            enable_swimlane_overhead=enable_swimlane_overhead,
         )
 
     # ------------------------------------------------------------------
@@ -1283,13 +1493,21 @@ class SceneTestCase:
             "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
         )
         parser.add_argument(
-            "--dump-tensor",
+            "--enable-device-log-timing",
+            action="store_true",
+            help="After the run, parse the CANN device log and print per-round Total / Orch / "
+            "Sched timing (from PTO2_PROFILING markers; no swimlane needed). Works with --rounds N "
+            "(one row per round). Onboard only — ignored on sim and L3.",
+        )
+        parser.add_argument(
+            "--dump-args",
             nargs="?",
             const=1,
             type=int,
             default=0,
-            help="Dump per-task tensor I/O at runtime. Level: 0=off, 1=partial (only "
-            "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks).",
+            help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
+            "tasks marked via Arg::dump(...), default when given without a value), "
+            "2=full (all tasks), 3=full_json_only (all tasks, JSON metadata only, no .bin payload).",
         )
         parser.add_argument(
             "--enable-dep-gen",
@@ -1312,6 +1530,15 @@ class SceneTestCase:
             default=False,
             help="Enable per-scope peak collection and emit <output_prefix>/scope_stats/scope_stats.jsonl "
             "(per-scope ring-fill peaks).",
+        )
+        parser.add_argument(
+            "--enable-swimlane-overhead",
+            action="store_true",
+            default=False,
+            help="Add the 8 Overhead Analysis counter tracks (per-engine "
+            "idle/ready/overhead + system all/has overhead) to the swimlane "
+            "JSON. Requires --enable-l2-swimlane + deps.json (re-run with "
+            "--enable-dep-gen if absent).",
         )
         parser.add_argument(
             "--runtime",
@@ -1343,13 +1570,13 @@ class SceneTestCase:
             "-c",
             "--pto-isa-commit",
             default=None,
-            help="Checkout PTO-ISA at this git commit before running.",
+            help=("Override the PTO-ISA revision before running. Default/latest: use the current checkout HEAD."),
         )
         parser.add_argument(
             "--clone-protocol",
             choices=["ssh", "https"],
             default="ssh",
-            help="Git protocol for auto-cloning PTO-ISA (used with --pto-isa-commit). Default: ssh.",
+            help="Git protocol for auto-cloning PTO-ISA when PTO_ISA_ROOT is not set. Default: ssh.",
         )
         parser.add_argument(
             "--log-level",
@@ -1497,19 +1724,19 @@ class SceneTestCase:
         ok = True
         for (runtime, level), group in by_rt_level.items():
             print(f"\n=== Runtime: {runtime}  Level: {level} ===")
-            worker, per_class_sub_ids, per_class_chip_cids = _create_standalone_worker(
+            worker, per_class_sub_handles, per_class_chip_handles = _create_standalone_worker(
                 group, level, args, selected_by_cls
             )
             try:
                 for cls in group:
                     inst = cls()
                     callable_obj = inst.build_callable(args.platform)
-                    sub_ids = per_class_sub_ids.get(cls, {})
-                    chip_cids = per_class_chip_cids.get(cls, {})
-                    # For L3: merge chip cids into callable_obj (replacing
-                    # ChipCallable objects with their registered cid).
-                    if level == 3 and chip_cids:
-                        callable_obj = {**chip_cids}
+                    sub_handles = per_class_sub_handles.get(cls, {})
+                    chip_handles = per_class_chip_handles.get(cls, {})
+                    # For L3: merge chip handles into callable_obj (replacing
+                    # ChipCallable objects with their registered handle).
+                    if level == 3 and chip_handles:
+                        callable_obj = {**chip_handles}
                     for case in selected_by_cls[cls]:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
@@ -1519,14 +1746,16 @@ class SceneTestCase:
                                 inst,
                                 [case],
                                 callable_obj=callable_obj,
-                                sub_ids=sub_ids,
+                                sub_handles=sub_handles,
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_l2_swimlane=args.enable_l2_swimlane,
-                                enable_dump_tensor=args.dump_tensor,
+                                enable_dump_args=args.dump_args,
                                 enable_pmu=args.enable_pmu,
                                 enable_dep_gen=args.enable_dep_gen,
                                 enable_scope_stats=args.enable_scope_stats,
+                                enable_device_log_timing=args.enable_device_log_timing,
+                                enable_swimlane_overhead=args.enable_swimlane_overhead,
                             )
                             print("PASSED")
                         except Exception as e:  # noqa: BLE001
@@ -1564,12 +1793,16 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--skip-golden")
     if args.enable_l2_swimlane:
         common += ["--enable-l2-swimlane", str(args.enable_l2_swimlane)]
-    if args.dump_tensor:
-        common.append("--dump-tensor")
+    if args.dump_args:
+        common += ["--dump-args", str(args.dump_args)]
     if args.enable_dep_gen:
         common.append("--enable-dep-gen")
     if args.enable_scope_stats:
         common.append("--enable-scope-stats")
+    if args.enable_device_log_timing:
+        common.append("--enable-device-log-timing")
+    if args.enable_swimlane_overhead:
+        common.append("--enable-swimlane-overhead")
 
     # ----- L3 phase: one subprocess per class (not per case).
     # The child's _create_standalone_worker allocates max(cls.CASES.device_count)
@@ -1744,7 +1977,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     otherwise a manual case with a larger ``device_count`` inflates the
     allocation even when it isn't scheduled.
 
-    Returns ``(worker, per_class_sub_ids, per_class_chip_cids)`` for both
+    Returns ``(worker, per_class_sub_handles, per_class_chip_handles)`` for both
     L2 and L3 so the caller can unpack uniformly. L2 has neither sub
     callables nor pre-registered chip callables, so both dicts are empty.
     """
@@ -1776,26 +2009,26 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         platform=args.platform,
         runtime=first_cls._st_runtime,
     )
-    # Register sub callables per-class to avoid name collisions
-    per_class_sub_ids: dict[type, dict] = {}
-    # Also register ChipCallables here (before init) so the chip children
+    # Prepare sub callables per-class to avoid name collisions.
+    per_class_sub_handles: dict[type, dict] = {}
+    # Also prepare ChipCallables here (before init) so the chip children
     # pre-warm them via _CTRL_PREPARE.
-    per_class_chip_cids: dict[type, dict] = {}
+    per_class_chip_handles: dict[type, dict] = {}
     for cls in group:
-        cls_sub_ids = {}
-        cls_chip_cids = {}
+        cls_sub_handles = {}
+        cls_chip_handles = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
-                cid = worker.register(entry["callable"])
-                cls_sub_ids[entry["name"]] = cid
+                handle = worker.register(entry["callable"])
+                cls_sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 name = entry["name"]
                 cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
-                cid = worker.register(chip)
-                cls_chip_cids[name] = cid
-                cls_chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
-        per_class_sub_ids[cls] = cls_sub_ids
-        per_class_chip_cids[cls] = cls_chip_cids
+                handle = worker.register(chip)
+                cls_chip_handles[name] = handle
+                cls_chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])
+        per_class_sub_handles[cls] = cls_sub_handles
+        per_class_chip_handles[cls] = cls_chip_handles
     worker.init()
-    return worker, per_class_sub_ids, per_class_chip_cids
+    return worker, per_class_sub_handles, per_class_chip_handles

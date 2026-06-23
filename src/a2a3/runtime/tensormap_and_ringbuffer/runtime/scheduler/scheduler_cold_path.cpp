@@ -18,6 +18,7 @@
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
@@ -193,8 +194,11 @@ void format_core_status(
         );
     } else {
         snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s ANOMALY)", core_id, kernel,
-            task_id_raw, cond_reg_state_str
+            buf, buf_size,
+            "core%d(busy kernel=%d task=%" PRId64
+            " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
+            core_id, kernel, task_id_raw, cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
+            core_state->running_reg_task_id, core_state->pending_reg_task_id
         );
     }
 }
@@ -326,7 +330,7 @@ void SchedulerContext::log_stall_diagnostics(
         bool aiv0_idle = tracker.is_aiv0_core_idle(offset);
         bool aiv1_idle = tracker.is_aiv1_core_idle(offset);
         int32_t cluster_id = cli * ast + thread_idx;
-        char aic_buf[128], aiv0_buf[128], aiv1_buf[128];
+        char aic_buf[192], aiv0_buf[192], aiv1_buf[192];
         format_core_status(
             aic_buf, sizeof(aic_buf), aic_id, aic_idle, &core_exec_states_[aic_id], core_exec_states_[aic_id].reg_addr
         );
@@ -381,6 +385,24 @@ int32_t SchedulerContext::handle_timeout_exit(
     latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT);
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
+#if PTO2_PROFILING
+        // Capture the in-flight kernels' partial output before signalling the
+        // cores to exit, so the dump reflects the live stuck state.
+        if (is_dump_args_enabled()) {
+            dump_running_task_outputs<PTO2_SUBTASK_SLOT_COUNT>(
+                thread_idx, cores_total_num_,
+                [this](int32_t cid) {
+                    return core_exec_states_[cid].running_slot_state;
+                },
+                [](ActiveMask active_mask, int raw_subtask_id) {
+                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                },
+                [this](int32_t func_id) {
+                    return get_function_bin_addr(func_id);
+                }
+            );
+        }
+#endif
         emergency_shutdown(runtime);
     }
 #if PTO2_PROFILING
@@ -476,24 +498,9 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
             l2_swimlane.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        // pop_hit / pop_miss per-emit deltas live in each dispatch-phase
-        // record's extras in aicpu_scheduler_phases[]; sum-of-deltas equals
-        // the run-cumulative tracked in this struct (final-drain emit covers
-        // the trailing-idle tail).
         LOG_INFO_V9(
             "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_dispatch_cycle),
             l2_swimlane.sched_dispatch_cycle * 100.0 / sched_total
-        );
-        uint64_t global_dispatch_count = l2_swimlane.pop_hit - l2_swimlane.local_dispatch_count;
-        uint64_t total_dispatched = l2_swimlane.local_dispatch_count + global_dispatch_count;
-        double local_hit_rate =
-            total_dispatched > 0 ? l2_swimlane.local_dispatch_count * 100.0 / total_dispatched : 0.0;
-        LOG_INFO_V9(
-            "Thread %d:     local_disp   : local=%" PRIu64 ", global=%" PRIu64 ", overflow=%" PRIu64
-            ", local_rate=%.1f%%",
-            thread_idx, static_cast<uint64_t>(l2_swimlane.local_dispatch_count),
-            static_cast<uint64_t>(global_dispatch_count), static_cast<uint64_t>(l2_swimlane.local_overflow_count),
-            local_hit_rate
         );
 
         uint64_t d_parent = l2_swimlane.sched_dispatch_cycle > 0 ? l2_swimlane.sched_dispatch_cycle : 1;
@@ -866,18 +873,17 @@ int32_t SchedulerContext::init(
         l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            // Sched-phase pool count: matches the dump_tensor_init branch in
-            // scheduler_dispatch.cpp. Orch-phase pool count: typically 1 (one
-            // orch thread), but in orch_to_sched mode all scheduler threads
-            // can write orch records, so we size both pools to aicpu_thread_num_.
-            // sched_thread_num_ <= 0 means "use all AICPU threads as scheduler
-            // threads" (see assign_cores_to_threads' active_sched_threads_
-            // normalization at line 689). Without this normalization here,
-            // init_phase would prime zero sched pools and all sched_phase
-            // emits would silently drop.
+            // Sched-phase pool count: matches the dump_args_init branch in
+            // scheduler_dispatch.cpp. sched_thread_num_ <= 0 means "use all
+            // AICPU threads as scheduler threads" (see assign_cores_to_threads'
+            // active_sched_threads_ normalization at line 689). Without this
+            // normalization here, init_phase would prime zero sched pools and
+            // all sched_phase emits would silently drop.
             const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
             const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
-            const int orch_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : 1;
+            // Orchestration is always single-threaded, so orch-phase is one pool
+            // (ordinal 0) in both modes — see record_orch_phase.
+            const int orch_phase_threads = 1;
             l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
@@ -898,11 +904,19 @@ int32_t SchedulerContext::init(
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
         auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        int32_t pto2_count = 0;
+        // Read at one-time boot init, before the SM is reset for the run, so a
+        // ring not yet written holds uninitialized memory (0xbe... under ASAN's
+        // malloc-fill). Sum in int64 and only count rings whose value is a
+        // plausible task count — (0, PTO2_SCOPE_TASKS_CAP]; a ring cannot hold
+        // more than the scope cap. This rejects any garbage pattern (negative
+        // or positive), so uninitialized rings contribute 0 (the correct boot
+        // count) while valid counts still add up, with no signed overflow.
+        int64_t pto2_count = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            pto2_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) pto2_count += ring_tasks;
         }
-        total_tasks_ = pto2_count > 0 ? pto2_count : 0;
+        total_tasks_ = static_cast<int32_t>(pto2_count);
     } else {
         total_tasks_ = 0;
     }
@@ -1005,9 +1019,11 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        // Flush orchestrator's phase record buffer
-        l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
+        // Flush the orchestrator's orch-phase buffer (single instance, pool 0).
+        // The orchestrator has no scheduler-phase pool of its own — those belong
+        // to the scheduler threads and are flushed in scheduler_dispatch.
+        l2_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
     }
 #endif
 

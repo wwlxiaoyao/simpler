@@ -180,7 +180,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
     }
 
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
+    if (is_dump_args_enabled()) {
         uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
         if (callable_addr != 0) {
             const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
@@ -189,7 +189,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
             uint64_t tensor_buffer_addrs[RUNTIME_MAX_ARGS] = {};
             int tensor_buffer_count =
                 collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
-            dump_tensors_for_task(
+            dump_args_for_task(
                 thread_idx, static_cast<uint64_t>(task->task_id), task->num_args, *callable, tensor_info,
                 tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::AFTER_COMPLETION
             );
@@ -261,7 +261,7 @@ inline bool AicpuExecutor::try_dispatch_task(
     );
 
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
+    if (is_dump_args_enabled()) {
         Task *task = runtime_->get_task(task_id);
         if (task != nullptr) {
             uint64_t callable_addr = runtime_->get_function_bin_addr(task->func_id);
@@ -272,7 +272,7 @@ inline bool AicpuExecutor::try_dispatch_task(
                 uint64_t tensor_buffer_addrs[RUNTIME_MAX_ARGS] = {};
                 int tensor_buffer_count =
                     collect_task_tensor_buffer_addrs(*runtime_, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
-                dump_tensors_for_task(
+                dump_args_for_task(
                     thread_idx, static_cast<uint64_t>(task_id), task->num_args, *callable, tensor_info,
                     tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::BEFORE_DISPATCH
                 );
@@ -284,9 +284,10 @@ inline bool AicpuExecutor::try_dispatch_task(
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
 
-    // Record the real AICPU dispatch point for this core.
-    if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
-        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    // AICore buffer rotation: count this dispatch and rotate before write_reg
+    // when crossing a BUFFER_SIZE boundary.
+    if (l2_swimlane_enabled) {
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
     }
 
     // Publish task data before AICore can observe the dispatched task_id.
@@ -294,6 +295,13 @@ inline bool AicpuExecutor::try_dispatch_task(
     // Device-nGnRnE; the old write_reg() helper carried this implicitly via
     // __sync_synchronize.
     wmb();
+
+    // Capture dispatch timestamp at the latest possible moment — after wmb,
+    // immediately before the DATA_MAIN_BASE write.
+    if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
+        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    }
+
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
 
     return true;
@@ -361,8 +369,8 @@ int AicpuExecutor::init(Runtime *runtime) {
         l2_swimlane_aicpu_init(runtime->worker_count);
     }
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
-        dump_tensor_init(aicpu_thread_num_);
+    if (is_dump_args_enabled()) {
+        dump_args_init(aicpu_thread_num_);
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
@@ -744,19 +752,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
-                        Task *prev_task = &runtime.tasks[prev_running_id];
-                        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        int fanout_count = 0;
-                        if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                            for (int i = 0; i < prev_task->fanout_count; i++) {
-                                fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
-                            }
-                            fanout_count = prev_task->fanout_count;
-                        }
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                                dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_swimlane_aicpu_complete_task failed for implicit task %d", core_id,
@@ -769,19 +767,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     }
 
                     finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                    Task *task = &runtime.tasks[completed_task_id];
-                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    int fanout_count = 0;
-                    if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                        for (int i = 0; i < task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
-                        }
-                        fanout_count = task->fanout_count;
-                    }
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                            dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_swimlane_aicpu_complete_task failed for task %d", core_id, completed_task_id
@@ -866,19 +854,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     if (l2_swimlane_enabled) {
                         uint64_t finish_ts =
                             (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                        Task *prev_task = &runtime.tasks[prev_running_id];
-                        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        int fanout_count = 0;
-                        if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                            for (int i = 0; i < prev_task->fanout_count; i++) {
-                                fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
-                            }
-                            fanout_count = prev_task->fanout_count;
-                        }
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                                dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_swimlane_aicpu_complete_task failed for implicit task %d", core_id,
@@ -917,19 +895,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 if (l2_swimlane_enabled) {
                     uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                    Task *task = &runtime.tasks[completed_task_id];
-                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    int fanout_count = 0;
-                    if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                        for (int i = 0; i < task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
-                        }
-                        fanout_count = task->fanout_count;
-                    }
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                            dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_swimlane_aicpu_complete_task failed for task %d", core_id, completed_task_id
@@ -1138,8 +1106,8 @@ int AicpuExecutor::run(Runtime *runtime) {
     if (is_pmu_enabled()) {
         pmu_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
-    if (is_dump_tensor_enabled()) {
-        dump_tensor_flush(thread_idx);
+    if (is_dump_args_enabled()) {
+        dump_args_flush(thread_idx);
     }
 #endif
 

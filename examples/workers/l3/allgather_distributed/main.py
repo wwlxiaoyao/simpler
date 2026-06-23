@@ -35,10 +35,10 @@ from simpler.task_interface import (  # noqa: E402
     CallConfig,
     ChipCallable,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -139,7 +139,7 @@ def run(
         device_ids=device_ids,
         num_sub_workers=0,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
 
     try:
         print("[allgather] init worker (forks chip children; base comm is lazy)...")
@@ -163,7 +163,7 @@ def run(
                     chip_args.add_tensor(make_tensor_arg(host_inputs[i]), TensorArgType.INPUT)
                     chip_args.add_tensor(make_tensor_arg(host_outputs[i]), TensorArgType.OUTPUT_EXISTING)
                     chip_args.add_tensor(
-                        ContinuousTensor.make(
+                        Tensor.make(
                             data=domain.buffer_ptrs["scratch"],
                             shapes=(COUNT_PER_RANK,),
                             dtype=DataType.FLOAT32,
@@ -173,7 +173,7 @@ def run(
                     )
                     chip_args.add_scalar(domain.domain_size)
                     chip_args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+                    orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
         print(f"[allgather] running {nranks}-chip allgather DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

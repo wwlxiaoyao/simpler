@@ -73,7 +73,7 @@ void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
     ,
-    uint64_t dispatch_ts
+    uint64_t dispatch_ts, uint64_t finish_ts
 #endif
 ) {
 #if PTO2_PROFILING
@@ -124,9 +124,9 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
-    bool mixed_complete = sched_->on_subtask_complete(slot_state);
+    bool task_complete = sched_->on_subtask_complete(slot_state);
 
-    if (mixed_complete && slot_state.payload != nullptr &&
+    if (task_complete && slot_state.payload != nullptr &&
         slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
@@ -135,10 +135,10 @@ void SchedulerContext::complete_slot_task(
         defer_completion_to_consumer = true;
     }
 
-    if (mixed_complete && !defer_completion_to_consumer) {
+    if (task_complete && !defer_completion_to_consumer) {
 #if PTO2_PROFILING
-        if (is_dump_tensor_enabled()) {
-            dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+        if (is_dump_args_enabled()) {
+            dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                 thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
                 [](ActiveMask active_mask, int raw_subtask_id) {
                     return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
@@ -153,9 +153,9 @@ void SchedulerContext::complete_slot_task(
         // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
         // by the otc_* log lines). Its return value is unused.
-        (void)sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+        (void)sched_->on_task_complete(slot_state, thread_idx, local_bufs);
 #else
-        sched_->on_mixed_task_complete(slot_state, local_bufs);
+        sched_->on_task_complete(slot_state, local_bufs);
 #endif
 #if PTO2_PROFILING
         l2_swimlane.phase_complete_count++;
@@ -179,28 +179,18 @@ void SchedulerContext::complete_slot_task(
     }
 
 #if PTO2_PROFILING
-    if (l2_swimlane.l2_swimlane_enabled) {
+    // Level gate: at AICORE_TIMING (level=1) the AICore record alone carries
+    // {start, end, task_token_raw}, host resolves func_id/core_type from
+    // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
+    // AICPU_TIMING (level=2) and above does AICPU contribute dispatch/finish
+    // timestamps via complete_task.
+    if (l2_swimlane.l2_swimlane_enabled && l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = 0;
-        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-        int32_t fanout_n = 0;
 
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            finish_ts = get_sys_cnt_aicpu();
-            PTO2DepListEntry *cur = slot_state.fanout_head;
-            while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-                fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-                cur = cur->next;
-            }
-        }
-
-        int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_swimlane_aicpu_complete_task(
-                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
-                fanout_n
+                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), dispatch_ts, finish_ts
             ) != 0) {
             LOG_ERROR(
                 "Core %d: l2_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
@@ -289,6 +279,17 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
+#if PTO2_PROFILING
+        // Capture finish_ts at the FIN observation point — right after rmb()
+        // pinned cacheable AICore reads downstream of the register load, and
+        // BEFORE any fanin / deferred-release work. Anything later would
+        // charge AICPU completion-processing cost to (end → finish).
+        uint64_t finish_ts = 0;
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+            finish_ts = get_sys_cnt_aicpu();
+        }
+#endif
+
         // --- Apply phase: execute actions based on transition ---
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
@@ -298,7 +299,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.pending_dispatch_timestamp
+                core.pending_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;
@@ -309,7 +310,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.running_dispatch_timestamp
+                core.running_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;
@@ -379,10 +380,14 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
 }
 
 // Count total available resources across all scheduler threads for a given shape.
-int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
+int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
-        total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        if (shape == PTO2ResourceShape::MIX) {
+            total += core_trackers_[t].count_mix_running_clusters(core_mask);
+        } else {
+            total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        }
     }
     return total;
 }
@@ -397,9 +402,12 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+    uint8_t core_mask = slot_state->active_mask.core_mask();
 
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
-        auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
+        auto valid = (shape == PTO2ResourceShape::MIX) ?
+                         core_trackers_[t].get_mix_running_cluster_offset_states(core_mask) :
+                         core_trackers_[t].get_idle_core_offset_states(shape);
         while (valid.has_value() && slot_state->next_block_idx < block_num) {
             dispatch_block(runtime, t, valid.pop_first(), *slot_state, shape, false, slot_state->next_block_idx);
             slot_state->next_block_idx++;
@@ -429,9 +437,20 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
 //      Non-elected threads spin-wait until sync_start_pending == 0.
 //      During dispatch the elected thread has exclusive tracker access.
 void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
+    // Every spin in this function honors is_completed(): once the run latches
+    // completed_ (all tasks done, or a fatal error raised elsewhere), peers leave
+    // the dispatch loop and stop participating in the drain. A thread parked in a
+    // drain spin would then wait forever for acks / a gate-open that can no longer
+    // arrive -- the AICPU watchdog never fires here because these spins live
+    // outside the dispatch loop's wall-clock budget, so the hang escalates straight
+    // to the 3 s STARS op-exec timeout (507018) and poisons the device. Bailing on
+    // completed_ is always safe: any pending sync_start task is either already
+    // dispatched (a stale re-popped slot) or moot under teardown, and deinit()
+    // resets drain_state_ before the next run, so leaving it dirty is harmless.
     // Spin until drain is fully initialized (sentinel -1 -> block_num > 0).
     int32_t block_num;
     do {
+        if (is_completed()) return;
         block_num = drain_state_.sync_start_pending.load(std::memory_order_acquire);
     } while (block_num < 0);
     if (block_num == 0) return;
@@ -444,6 +463,7 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
     // Spin until all threads have acked.
     // If our bit is cleared while waiting, elected reset due to insufficient resources.
     while (true) {
+        if (is_completed()) return;
         uint32_t ack = drain_state_.drain_ack_mask.load(std::memory_order_acquire);
         if ((ack & all_acked) == all_acked) break;
         if ((ack & (1u << thread_idx)) == 0) return;
@@ -459,6 +479,7 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
     if (drain_state_.drain_worker_elected.load(std::memory_order_relaxed) != thread_idx + 1) {
         // Non-elected: spin-wait for drain completion or resource-insufficient reset.
         while (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            if (is_completed()) return;
             if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
             SPIN_WAIT_HINT();
         }
@@ -478,7 +499,7 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-    int32_t available = count_global_available(shape);
+    int32_t available = count_global_available(shape, slot_state->active_mask.core_mask());
 
     if (available < block_num) {
         // Insufficient resources -- reset drain fields so threads can resume

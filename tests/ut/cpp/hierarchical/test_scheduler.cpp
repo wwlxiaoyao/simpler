@@ -17,8 +17,11 @@
 #include <chrono>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "call_config.h"
@@ -34,7 +37,7 @@
 // ---------------------------------------------------------------------------
 // MockMailboxWorker: in-process stand-in for the forked Python child loop.
 //
-// The production dispatch path writes (callable, config, args_blob) into a
+// The production dispatch path writes (callable digest, config, args_blob) into a
 // MAILBOX_SIZE-byte shared region and spin-polls TASK_DONE; the real child
 // (`_chip_process_loop` in python/simpler/worker.py) decodes the mailbox and
 // dispatches to a `ChipWorker`. For unit testing the Scheduler / WorkerManager
@@ -43,7 +46,7 @@
 // test thread releases it via `complete()`.
 //
 // API parity with the previous MockWorker:
-//   - dispatched[i].callable / .tensor_key — recorded on TASK_READY
+//   - dispatched[i].callable_hash0 / .tensor_key — recorded on TASK_READY
 //   - is_running                            — atomic flag the test polls
 //   - wait_running()                        — spin-wait until is_running flips
 //   - complete()                            — release the parked dispatch so
@@ -52,7 +55,7 @@
 
 struct MockMailboxWorker {
     struct Record {
-        uint64_t callable;
+        uint8_t callable_hash0;
         uint64_t tensor_key;  // first tensor's `data` field (unique per submit in tests)
     };
 
@@ -63,6 +66,8 @@ struct MockMailboxWorker {
     std::mutex run_mu;
     std::condition_variable run_cv;
     std::atomic<bool> should_complete{false};
+    int32_t next_error_code{0};
+    std::string next_error_msg;
     std::atomic<bool> is_running{false};
     std::atomic<bool> stop_flag{false};
     std::thread loop_thread;
@@ -80,7 +85,7 @@ struct MockMailboxWorker {
         // dispatch, set stop_flag and wake the parked loop so the thread
         // joins instead of leaking. The loop's TASK_READY branch always
         // publishes TASK_DONE before checking stop_flag, so any in-flight
-        // WorkerThread::dispatch_process completes its spin-poll cleanly.
+        // LocalMailboxEndpoint::run completes its spin-poll cleanly.
         stop_flag.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(run_mu);
@@ -94,6 +99,16 @@ struct MockMailboxWorker {
 
     void complete() {
         std::lock_guard<std::mutex> lk(run_mu);
+        next_error_code = 0;
+        next_error_msg.clear();
+        should_complete.store(true, std::memory_order_release);
+        run_cv.notify_one();
+    }
+
+    void complete_with_error(std::string msg) {
+        std::lock_guard<std::mutex> lk(run_mu);
+        next_error_code = 1;
+        next_error_msg = std::move(msg);
         should_complete.store(true, std::memory_order_release);
         run_cv.notify_one();
     }
@@ -131,21 +146,20 @@ private:
             if (stop_flag.load(std::memory_order_acquire)) return;
             MailboxState s = read_state();
             if (s == MailboxState::TASK_READY) {
-                uint64_t callable = 0;
-                std::memcpy(&callable, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(uint64_t));
+                uint8_t callable_hash0 = static_cast<uint8_t>(mailbox[MAILBOX_OFF_TASK_CALLABLE_HASH]);
                 int32_t t_count = 0;
-                std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_ARGS, sizeof(int32_t));
+                std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB, sizeof(int32_t));
                 uint64_t tensor_key = 0;
                 if (t_count > 0) {
-                    ContinuousTensor first{};
+                    Tensor first{};
                     std::memcpy(
-                        &first, mailbox.data() + MAILBOX_OFF_ARGS + TASK_ARGS_BLOB_HEADER_SIZE, sizeof(ContinuousTensor)
+                        &first, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB + TASK_ARGS_BLOB_HEADER_SIZE, sizeof(Tensor)
                     );
-                    tensor_key = first.data;
+                    tensor_key = first.buffer.addr;
                 }
                 {
                     std::lock_guard<std::mutex> lk(dispatched_mu);
-                    dispatched.push_back({callable, tensor_key});
+                    dispatched.push_back({callable_hash0, tensor_key});
                 }
                 is_running.store(true, std::memory_order_release);
 
@@ -156,11 +170,23 @@ private:
                     });
                     should_complete.store(false, std::memory_order_relaxed);
                 }
+                int32_t error_code = 0;
+                std::string error_msg;
+                {
+                    std::lock_guard<std::mutex> lk(run_mu);
+                    error_code = next_error_code;
+                    error_msg = std::move(next_error_msg);
+                    next_error_code = 0;
+                    next_error_msg.clear();
+                }
                 is_running.store(false, std::memory_order_release);
 
-                int32_t zero_err = 0;
-                std::memcpy(mailbox.data() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
+                std::memcpy(mailbox.data() + MAILBOX_OFF_ERROR, &error_code, sizeof(int32_t));
                 std::memset(mailbox.data() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+                if (!error_msg.empty()) {
+                    size_t n = std::min(error_msg.size(), MAILBOX_ERROR_MSG_SIZE - 1);
+                    std::memcpy(mailbox.data() + MAILBOX_OFF_ERROR_MSG, error_msg.data(), n);
+                }
                 write_state(MailboxState::TASK_DONE);
             } else if (s == MailboxState::CONTROL_REQUEST) {
                 // Acknowledge the control request so a future test using
@@ -181,19 +207,49 @@ private:
     }
 };
 
+class FakeEndpoint final : public WorkerEndpoint {
+public:
+    explicit FakeEndpoint(int32_t endpoint_id) {
+        caps_.kind = WorkerEndpointKind::REMOTE_L3;
+        caps_.endpoint_id = endpoint_id;
+        caps_.remote = true;
+        caps_.transport = "test-remote";
+    }
+
+    const WorkerEndpointCaps &caps() const override { return caps_; }
+
+    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override {
+        (void)ring;
+        WorkerCompletion completion;
+        completion.task_slot = dispatch.task_slot;
+        completion.group_index = dispatch.group_index;
+        completion.outcome = EndpointOutcome::SUCCESS;
+        return completion;
+    }
+
+private:
+    WorkerEndpointCaps caps_;
+};
+
 // ---------------------------------------------------------------------------
 // Helper: build a TaskArgs whose only tensor has the given (data, tag).
 // ---------------------------------------------------------------------------
 
 static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
     TaskArgs a;
-    ContinuousTensor t{};
-    t.data = data_ptr;
+    Tensor t{};
+    t.buffer.addr = data_ptr;
     t.ndims = 1;
     t.shapes[0] = 1;
     t.dtype = DataType::UINT8;
     a.add_tensor(t, tag);
     return a;
+}
+
+static CallableIdentity C(uint8_t seed) {
+    CallableIdentity c;
+    c.digest.fill(seed);
+    return c;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,12 +276,12 @@ struct SchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
 
         mock_worker.start();
         manager.add_next_level(mock_worker.mailbox_ptr());
-        manager.start(&allocator, [this](TaskSlot slot) {
-            sched.worker_done(slot);
+        manager.start(&allocator, [this](WorkerCompletion completion) {
+            sched.worker_done(std::move(completion));
         });
 
         Scheduler::Config c;
@@ -265,15 +321,37 @@ struct SchedulerFixture : public ::testing::Test {
 // Tests
 // ---------------------------------------------------------------------------
 
+TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelEndpointId) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    WorkerManager manager;
+
+    manager.add_next_level(mailbox.data());
+    manager.add_next_level_endpoint(std::make_unique<FakeEndpoint>(0));
+
+    bool threw = false;
+    try {
+        manager.start(&allocator, [](WorkerCompletion) {});
+    } catch (const std::runtime_error &e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("duplicate NEXT_LEVEL endpoint_id 0"), std::string::npos);
+    }
+
+    manager.stop();
+    allocator.shutdown();
+    EXPECT_TRUE(threw);
+}
+
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
-    auto res = orch.submit_next_level(42, args_a, cfg);
+    auto res = orch.submit_next_level(C(42), args_a, cfg);
     TaskSlot slot = res.task_slot;
 
     mock_worker.wait_running();
     ASSERT_GE(mock_worker.dispatched_count(), 1);
     EXPECT_EQ(mock_worker.dispatched[0].tensor_key, 0xCAFEu);
-    EXPECT_EQ(mock_worker.dispatched[0].callable, 42u);
+    EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 42u);
 
     mock_worker.complete();
     wait_consumed(slot);
@@ -281,14 +359,14 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
 
 TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
     auto args_a = single_tensor_args(0xBEEF, TensorArgType::OUTPUT);
-    auto a = orch.submit_next_level(10, args_a, cfg);
+    auto a = orch.submit_next_level(C(10), args_a, cfg);
 
     auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
-    auto b = orch.submit_next_level(11, args_b, cfg);
+    auto b = orch.submit_next_level(C(11), args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     mock_worker.wait_running();
-    EXPECT_EQ(mock_worker.dispatched[0].callable, 10u);
+    EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 10u);
     mock_worker.complete();  // A done
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
@@ -296,11 +374,66 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_GE(mock_worker.dispatched_count(), 2);
-    EXPECT_EQ(mock_worker.dispatched[1].callable, 11u);
+    EXPECT_EQ(mock_worker.dispatched[1].callable_hash0, 11u);
 
     mock_worker.complete();  // B done
     wait_consumed(b.task_slot);
     (void)a;
+}
+
+// Issue #1024: composed child kernels can carry far more tensor args than a
+// top-level entry (repro: 76 tensors + 2 scalars = 3064-byte blob). The
+// mailbox must hold any blob the runtime itself accepts, i.e. up to
+// CHIP_MAX_TENSOR_ARGS / CHIP_MAX_SCALAR_ARGS.
+TEST_F(SchedulerFixture, ComposedKernelArgsBlobFitsMailbox) {
+    constexpr size_t max_blob = TASK_ARGS_BLOB_HEADER_SIZE +
+                                static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(Tensor) +
+                                static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t);
+    EXPECT_GE(MAILBOX_ARGS_CAPACITY, max_blob);
+
+    TaskArgs args;
+    for (int i = 0; i < 76; ++i) {
+        Tensor t{};
+        t.buffer.addr = 0x1000u + static_cast<uint64_t>(i) * 0x100u;
+        t.ndims = 1;
+        t.shapes[0] = 1;
+        t.dtype = DataType::UINT8;
+        args.add_tensor(t, TensorArgType::OUTPUT);
+    }
+    args.add_scalar(1);
+    args.add_scalar(2);
+
+    auto res = orch.submit_next_level(C(76), args, cfg);
+
+    mock_worker.wait_running();
+    ASSERT_GE(mock_worker.dispatched_count(), 1)
+        << "dispatch never reached the child: args blob exceeds mailbox capacity";
+    EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 76u);
+
+    mock_worker.complete();
+    wait_consumed(res.task_slot);
+}
+
+TEST_F(SchedulerFixture, FailedProducerPoisonsDependentTask) {
+    auto args_a = single_tensor_args(0xD00D, TensorArgType::OUTPUT);
+    auto a = orch.submit_next_level(C(21), args_a, cfg);
+
+    auto args_b = single_tensor_args(0xD00D, TensorArgType::INPUT);
+    auto b = orch.submit_next_level(C(22), args_b, cfg);
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
+
+    mock_worker.wait_running();
+    ASSERT_EQ(mock_worker.dispatched_count(), 1);
+    EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 21u);
+
+    mock_worker.complete_with_error("root task boom");
+
+    wait_consumed(a.task_slot);
+    wait_consumed(b.task_slot);
+    EXPECT_TRUE(manager.has_error());
+    EXPECT_EQ(mock_worker.dispatched_count(), 1) << "poisoned consumer must not dispatch";
+    EXPECT_EQ(S(a.task_slot).state.load(), TaskState::CONSUMED);
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::CONSUMED);
 }
 
 // ===========================================================================
@@ -328,14 +461,14 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
 
         worker_a.start();
         worker_b.start();
         manager.add_next_level(worker_a.mailbox_ptr());
         manager.add_next_level(worker_b.mailbox_ptr());
-        manager.start(&allocator, [this](TaskSlot slot) {
-            sched.worker_done(slot);
+        manager.start(&allocator, [this](WorkerCompletion completion) {
+            sched.worker_done(std::move(completion));
         });
 
         Scheduler::Config c;
@@ -375,7 +508,7 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
     TaskArgs a0 = single_tensor_args(0xA0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xA1, TensorArgType::OUTPUT);
 
-    auto res = orch.submit_next_level_group(42, {a0, a1}, cfg);
+    auto res = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
     TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
@@ -400,7 +533,7 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
 TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
     TaskArgs a0 = single_tensor_args(0xB0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xB1, TensorArgType::OUTPUT);
-    auto res = orch.submit_next_level_group(42, {a0, a1}, cfg);
+    auto res = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
     TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
@@ -412,6 +545,92 @@ TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
 
     worker_b.complete();
     wait_consumed(slot);
+}
+
+TEST_F(GroupSchedulerFixture, GroupFailureWaitsForRunningMembersThenConsumes) {
+    TaskArgs a0 = single_tensor_args(0xC0, TensorArgType::OUTPUT);
+    TaskArgs a1 = single_tensor_args(0xC1, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
+    TaskSlot slot = res.task_slot;
+
+    worker_a.wait_running();
+    worker_b.wait_running();
+
+    worker_a.complete_with_error("member boom");
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (!manager.has_error() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(manager.has_error());
+    EXPECT_EQ(S(slot).state.load(), TaskState::RUNNING);
+
+    worker_b.complete();
+    wait_consumed(slot);
+    EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
+}
+
+TEST_F(GroupSchedulerFixture, InvalidGroupIndexFailsAndConsumesGroup) {
+    TaskArgs a0 = single_tensor_args(0xD0, TensorArgType::OUTPUT);
+    TaskArgs a1 = single_tensor_args(0xD1, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
+    TaskSlot slot = res.task_slot;
+
+    worker_a.wait_running();
+    worker_b.wait_running();
+
+    WorkerCompletion bad;
+    bad.task_slot = slot;
+    bad.group_index = 99;
+    bad.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+    bad.error_message = "bad completion index";
+    sched.worker_done(std::move(bad));
+
+    wait_consumed(slot);
+    EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
+
+    worker_a.complete();
+    worker_b.complete();
+}
+
+TEST_F(GroupSchedulerFixture, EndpointEligibilityRestrictsIdleSelection) {
+    TaskArgs args = single_tensor_args(0xE0, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level(C(55), args, cfg, -1, {1});
+    TaskSlot slot = res.task_slot;
+
+    worker_b.wait_running();
+    EXPECT_FALSE(worker_a.is_running.load());
+    EXPECT_TRUE(worker_b.is_running.load());
+    EXPECT_EQ(worker_a.dispatched_count(), 0);
+    EXPECT_EQ(worker_b.dispatched_count(), 1);
+
+    worker_b.complete();
+    wait_consumed(slot);
+}
+
+TEST_F(GroupSchedulerFixture, AffinityMustBeInEligibleEndpointSet) {
+    TaskArgs args = single_tensor_args(0xE1, TensorArgType::OUTPUT);
+    EXPECT_THROW((void)orch.submit_next_level(C(56), args, cfg, 0, {1}), std::invalid_argument);
+}
+
+TEST_F(GroupSchedulerFixture, RemoteSidecarRejectsLocalEndpointEligibility) {
+    TaskArgs args;
+    Tensor tensor{};
+    tensor.buffer.addr = 0;
+    tensor.ndims = 1;
+    tensor.shapes[0] = 1;
+    tensor.dtype = DataType::UINT8;
+    args.add_tensor(tensor, TensorArgType::OUTPUT);
+
+    RemoteTaskArgsSidecar sidecar;
+    sidecar.tensors.resize(1);
+    sidecar.tensors[0].present = true;
+    sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
+    sidecar.tensors[0].desc.owner_endpoint_id = 7;
+    sidecar.tensors[0].desc.buffer_id = 11;
+    sidecar.tensors[0].desc.generation = 1;
+    sidecar.tensors[0].desc.nbytes = 1;
+
+    EXPECT_THROW((void)orch.submit_next_level(C(57), args, cfg, -1, {0}, sidecar), std::invalid_argument);
 }
 
 // ===========================================================================
@@ -441,14 +660,14 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
 
         next_level_worker.start();
         sub_worker.start();
         manager.add_next_level(next_level_worker.mailbox_ptr());
         manager.add_sub(sub_worker.mailbox_ptr());
-        manager.start(&allocator, [this](TaskSlot slot) {
-            sched.worker_done(slot);
+        manager.start(&allocator, [this](WorkerCompletion completion) {
+            sched.worker_done(std::move(completion));
         });
 
         Scheduler::Config c;
@@ -491,7 +710,7 @@ TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) 
     // Submit a next-level task; the only chip worker begins running it and
     // stays blocked until we call complete() on it.
     auto chip_args = single_tensor_args(0xAAA, TensorArgType::OUTPUT);
-    auto chip = orch.submit_next_level(20, chip_args, cfg);
+    auto chip = orch.submit_next_level(C(20), chip_args, cfg);
     next_level_worker.wait_running();
     ASSERT_TRUE(next_level_worker.is_running.load());
 
@@ -501,7 +720,7 @@ TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) 
     // queues (Strict-4) it must dispatch immediately to the idle sub
     // worker.
     auto sub_args = single_tensor_args(0xBBB, TensorArgType::OUTPUT);
-    auto sub = orch.submit_sub(/*callable_id=*/7, sub_args);
+    auto sub = orch.submit_sub(C(7), sub_args);
 
     sub_worker.wait_running();
     EXPECT_TRUE(sub_worker.is_running.load());
@@ -522,10 +741,10 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     // Task B reads INPUT at the same key -- depends on group A.
     TaskArgs a0 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
-    auto a = orch.submit_next_level_group(42, {a0, a1}, cfg);
+    auto a = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
 
     auto args_b = single_tensor_args(0xCAFE, TensorArgType::INPUT);
-    auto b = orch.submit_next_level(42, args_b, cfg);
+    auto b = orch.submit_next_level(C(42), args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     worker_a.wait_running();

@@ -11,6 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
@@ -230,23 +231,61 @@ private:
         const AsyncCtx &async_ctx, int32_t block_idx
     );
 
-    void dispatch_subtask_to_core(
+    // Batched-dispatch primitives. prepare_* builds the payload and per-core
+    // state; publish_* issues the MMIO register write. Callers must wmb()
+    // between the prepare batch and the publish batch, then sample
+    // get_sys_cnt_aicpu() once and pass it to publish_* for every handle.
+    //
+    // dispatch_timestamp_slot points to the CoreExecState slot
+    // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
+    // prepare time, or nullptr when L2 swimlane is below AICPU_TIMING and no
+    // dispatch timestamp is being recorded.
+    struct PublishHandle {
+        uint64_t reg_addr;
+        uint32_t reg_task_id;
+        int32_t core_offset;
+        uint64_t *dispatch_timestamp_slot;
+    };
+
+    PublishHandle prepare_subtask_to_core(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
         bool to_pending, int32_t block_idx
     );
 
-    void dispatch_mix_block_to_cluster(
-        int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending, int32_t block_idx
-    );
+    inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts) {
+        if (h.dispatch_timestamp_slot != nullptr) {
+            *h.dispatch_timestamp_slot = dispatch_ts;
+        }
+        write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+    }
 
-    void dispatch_block(
+    // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
+    // caller-supplied handles buffer. Returns the number of handles written.
+    int prepare_block_for_dispatch(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-        bool to_pending, int32_t block_idx
+        bool to_pending, int32_t block_idx, PublishHandle *out_handles
     );
 
     void dispatch_shape(
         int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
         CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+    );
+
+    // Speculative early-dispatch (Hook 1). After normal dispatch leaves idle
+    // cores spare, pre-stage the consumers of any RUNNING flagged producer onto
+    // those cores with not_ready=1 (gated). Touches no dependency state — the
+    // task is released by the doorbell at its normal ready-pop (Hook 2).
+    int32_t try_speculative_early_dispatch(int32_t thread_idx);
+
+    // Stage the already-claimed range [start, start+count) of consumer `c` onto
+    // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
+    // cores from the provided free-core sets. The caller advances next_block_idx and
+    // re-pushes `c` BEFORE calling, so this expensive prepare+publish runs
+    // concurrently with peers (mirrors the normal SPMD dispatch path). Returns the
+    // number of blocks staged.
+    int32_t stage_consumer_blocks(
+        int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
     );
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
@@ -287,8 +326,9 @@ private:
     // Completion & drain (scheduler_completion.cpp)
     // =========================================================================
 
-    static SlotTransition
-    decide_slot_transition(int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id);
+    static SlotTransition decide_slot_transition(
+        int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
+    );
 
     void complete_slot_task(
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
@@ -297,7 +337,7 @@ private:
         PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
         ,
-        uint64_t dispatch_ts
+        uint64_t dispatch_ts, uint64_t finish_ts
 #endif
     );
 
@@ -311,7 +351,7 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(PTO2ResourceShape shape);
+    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask);
     void drain_worker_dispatch(int32_t block_num);
     void handle_drain_mode(int32_t thread_idx);
 

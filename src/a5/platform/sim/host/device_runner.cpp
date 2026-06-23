@@ -98,7 +98,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         if (!load_sym("aicpu_execute", reinterpret_cast<void **>(&aicpu_execute_func_))) return -1;
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_))) return -1;
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_))) return -1;
-        if (!load_sym("set_dump_tensor_enabled", reinterpret_cast<void **>(&set_dump_tensor_enabled_func_))) return -1;
+        if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_))) return -1;
         if (!load_sym("set_platform_l2_swimlane_base", reinterpret_cast<void **>(&set_platform_l2_swimlane_base_func_)))
             return -1;
         if (!load_sym("set_l2_swimlane_enabled", reinterpret_cast<void **>(&set_l2_swimlane_enabled_func_))) return -1;
@@ -255,11 +255,18 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     last_runtime_ = &runtime;
 
     if (enable_l2_swimlane_) {
-        rc = init_l2_swimlane(num_aicore, device_id_);
+        rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
         }
+        // Publish per-core core_type to the collector so the level=1 host
+        // emit path can label lanes without an AICPU record.
+        std::vector<CoreType> core_types(num_aicore);
+        for (int i = 0; i < num_aicore; i++) {
+            core_types[i] = runtime.workers[i].core_type;
+        }
+        l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
     if (enable_dump_tensor_) {
@@ -340,7 +347,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     );
 
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
-        set_platform_dump_base_func_ == nullptr || set_dump_tensor_enabled_func_ == nullptr ||
+        set_platform_dump_base_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
         set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
         set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
         set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
@@ -350,7 +357,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     set_platform_regs_func_(kernel_args_.regs);
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
-    set_dump_tensor_enabled_func_(enable_dump_tensor_);
+    set_dump_args_enabled_func_(enable_dump_tensor_);
     set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
@@ -417,7 +424,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
             aicore_execute_func_(
                 &runtime, i, core_type, physical_core_id, kernel_args_.regs, kernel_args_.enable_profiling_flag,
-                kernel_args_.aicore_l2_swimlane_ring_addrs, kernel_args_.aicore_pmu_ring_addrs
+                kernel_args_.l2_swimlane_aicore_rotation_table, kernel_args_.aicore_pmu_ring_addrs
             );
         }));
     }
@@ -503,7 +510,7 @@ void DeviceRunner::unload_executor_binaries() {
         aicpu_execute_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
-        set_dump_tensor_enabled_func_ = nullptr;
+        set_dump_args_enabled_func_ = nullptr;
         set_platform_l2_swimlane_base_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
@@ -598,15 +605,16 @@ void DeviceRunner::stop_collectors() {
     }
 }
 
-int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
+int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id) {
     int rc = l2_swimlane_collector_.initialize(
-        num_aicore, device_id, l2_swimlane_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
+        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, prof_alloc_cb, /*register_cb=*/nullptr,
+        prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.l2_swimlane_data_base =
             reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_l2_swimlane_setup_device_ptr());
-        kernel_args_.aicore_l2_swimlane_ring_addrs =
-            reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_aicore_ring_addrs_device_ptr());
+        kernel_args_.l2_swimlane_aicore_rotation_table =
+            reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_aicore_ring_addr_table_device_ptr());
     }
     return rc;
 }

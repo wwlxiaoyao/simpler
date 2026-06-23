@@ -29,7 +29,10 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include "ring.h"
 #include "orchestrator.h"
@@ -38,6 +41,162 @@
 #include "worker_manager.h"
 
 namespace nb = nanobind;
+
+class PyBufferView {
+public:
+    explicit PyBufferView(nb::handle obj) {
+        if (PyObject_GetBuffer(obj.ptr(), &view_, PyBUF_CONTIG_RO) != 0) {
+            throw nb::python_error();
+        }
+    }
+
+    ~PyBufferView() { PyBuffer_Release(&view_); }
+
+    PyBufferView(const PyBufferView &) = delete;
+    PyBufferView &operator=(const PyBufferView &) = delete;
+
+    const void *data() const { return view_.buf; }
+    Py_ssize_t size() const { return view_.len; }
+
+private:
+    Py_buffer view_{};
+};
+
+inline uint64_t checked_remote_range_end(const char *op_name, uint64_t base, uint64_t offset, uint64_t size) {
+    uint64_t max = std::numeric_limits<uint64_t>::max();
+    if (offset > max - size || base > max - offset - size) {
+        throw std::invalid_argument(std::string(op_name) + ": remote buffer range overflows");
+    }
+    return base + offset + size;
+}
+
+inline uint64_t
+validated_handle_nbytes(uint64_t nbytes, const char *op_name, uint64_t base, uint64_t offset, uint64_t size) {
+    uint64_t minimum = checked_remote_range_end(op_name, base, offset, size);
+    if (nbytes < minimum) {
+        throw std::invalid_argument(std::string(op_name) + ": handle_nbytes is smaller than requested range");
+    }
+    return nbytes;
+}
+
+inline std::string buffer_to_string(nb::handle obj, const char *field_name) {
+    PyBufferView view(obj);
+    if (view.size() < 0) {
+        throw std::invalid_argument(std::string(field_name) + " must not have negative length");
+    }
+    if (view.size() == 0) return {};
+    return std::string(static_cast<const char *>(view.data()), static_cast<size_t>(view.size()));
+}
+
+inline CallableKind parse_callable_kind(const std::string &kind) {
+    if (kind == "CHIP_CALLABLE") return CallableKind::CHIP_CALLABLE;
+    if (kind == "PYTHON_SERIALIZED") return CallableKind::PYTHON_SERIALIZED;
+    if (kind == "PYTHON_IMPORT") return CallableKind::PYTHON_IMPORT;
+    throw std::invalid_argument("CALLABLE_KIND_UNSUPPORTED: " + kind);
+}
+
+inline TargetNamespace parse_target_namespace(const std::string &target_namespace) {
+    if (target_namespace == "LOCAL_CHIP") return TargetNamespace::LOCAL_CHIP;
+    if (target_namespace == "LOCAL_PYTHON") return TargetNamespace::LOCAL_PYTHON;
+    if (target_namespace == "REMOTE_TASK_DISPATCHER") return TargetNamespace::REMOTE_TASK_DISPATCHER;
+    throw std::invalid_argument("unsupported callable target namespace: " + target_namespace);
+}
+
+inline remote_l3::RemoteRegistryTarget parse_remote_registry_target(const std::string &target_registry) {
+    if (target_registry == "REMOTE_TASK_DISPATCHER") return remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER;
+    if (target_registry == "INNER_L3_WORKER") return remote_l3::RemoteRegistryTarget::INNER_L3_WORKER;
+    throw std::invalid_argument("unsupported remote registry target: " + target_registry);
+}
+
+inline CallableIdentity
+make_callable_identity(nb::bytes digest, const std::string &kind, const std::string &target_namespace) {
+    PyBufferView view(digest);
+    if (view.size() != static_cast<Py_ssize_t>(CALLABLE_HASH_DIGEST_SIZE)) {
+        throw std::invalid_argument("callable digest must be exactly 32 bytes");
+    }
+    CallableIdentity out;
+    std::memcpy(out.digest.data(), view.data(), CALLABLE_HASH_DIGEST_SIZE);
+    out.kind = parse_callable_kind(kind);
+    out.target_namespace = parse_target_namespace(target_namespace);
+    return out;
+}
+
+inline std::string bytes_from_digest_arg(nb::object digest) {
+    std::string out = buffer_to_string(digest, "callable digest");
+    if (out.size() != CALLABLE_HASH_DIGEST_SIZE) {
+        throw std::invalid_argument("callable digest must be exactly 32 bytes");
+    }
+    return out;
+}
+
+inline std::vector<uint8_t> bytes_to_u8_vector(nb::handle obj, const char *field_name) {
+    PyBufferView view(obj);
+    if (view.size() < 0) {
+        throw std::invalid_argument(std::string(field_name) + " must not have negative length");
+    }
+    if (view.size() == 0) return {};
+    auto *begin = static_cast<const uint8_t *>(view.data());
+    return std::vector<uint8_t>(begin, begin + static_cast<size_t>(view.size()));
+}
+
+inline RemoteAddressSpace parse_remote_address_space(nb::handle value) {
+    int v = nb::cast<int>(value);
+    switch (v) {
+    case static_cast<int>(RemoteAddressSpace::HOST_INLINE):
+        return RemoteAddressSpace::HOST_INLINE;
+    case static_cast<int>(RemoteAddressSpace::REMOTE_DEVICE):
+        return RemoteAddressSpace::REMOTE_DEVICE;
+    case static_cast<int>(RemoteAddressSpace::REMOTE_WINDOW):
+        return RemoteAddressSpace::REMOTE_WINDOW;
+    case static_cast<int>(RemoteAddressSpace::UB_LDST):
+        return RemoteAddressSpace::UB_LDST;
+    default:
+        throw std::invalid_argument("unknown RemoteAddressSpace value: " + std::to_string(v));
+    }
+}
+
+inline RemoteTensorSidecar parse_remote_tensor_sidecar(nb::handle obj) {
+    RemoteTensorSidecar sidecar{};
+    if (obj.is_none()) return sidecar;
+
+    sidecar.present = nb::cast<bool>(obj.attr("present"));
+    if (!sidecar.present) return sidecar;
+
+    nb::object desc = obj.attr("desc");
+    sidecar.desc.address_space = parse_remote_address_space(desc.attr("address_space"));
+    sidecar.desc.owner_endpoint_id = nb::cast<int32_t>(desc.attr("owner_endpoint_id"));
+    sidecar.desc.buffer_id = nb::cast<uint64_t>(desc.attr("buffer_id"));
+    sidecar.desc.offset = nb::cast<uint64_t>(desc.attr("offset"));
+    sidecar.desc.nbytes = nb::cast<uint64_t>(desc.attr("nbytes"));
+    sidecar.desc.remote_addr = nb::cast<uint64_t>(desc.attr("remote_addr"));
+    sidecar.desc.rkey_or_token = nb::cast<uint64_t>(desc.attr("rkey_or_token"));
+    sidecar.desc.generation = nb::cast<uint64_t>(desc.attr("generation"));
+    sidecar.desc.inline_payload_offset = nb::cast<uint64_t>(desc.attr("inline_payload_offset"));
+    sidecar.desc.inline_payload_len = nb::cast<uint64_t>(desc.attr("inline_payload_len"));
+    sidecar.desc.flags = nb::cast<uint64_t>(desc.attr("flags"));
+    return sidecar;
+}
+
+inline RemoteTaskArgsSidecar parse_remote_task_args_sidecar(nb::handle obj) {
+    RemoteTaskArgsSidecar sidecar{};
+    if (obj.is_none()) return sidecar;
+
+    nb::object tensors_obj = obj.attr("tensors");
+    for (nb::handle item : nb::borrow<nb::iterable>(tensors_obj)) {
+        sidecar.tensors.push_back(parse_remote_tensor_sidecar(item));
+    }
+    sidecar.inline_payload = bytes_to_u8_vector(obj.attr("inline_payload"), "remote sidecar inline_payload");
+    return sidecar;
+}
+
+inline std::vector<RemoteTaskArgsSidecar> parse_remote_task_args_sidecars(nb::handle obj) {
+    std::vector<RemoteTaskArgsSidecar> sidecars;
+    if (obj.is_none()) return sidecars;
+    for (nb::handle item : nb::borrow<nb::iterable>(obj)) {
+        sidecars.push_back(parse_remote_task_args_sidecar(item));
+    }
+    return sidecars;
+}
 
 // ---------------------------------------------------------------------------
 // Mailbox acquire/release helpers (exposed to Python as _mailbox_load_i32 /
@@ -90,12 +249,8 @@ inline void bind_worker(nb::module_ &m) {
         .value("READY", TaskState::READY)
         .value("RUNNING", TaskState::RUNNING)
         .value("COMPLETED", TaskState::COMPLETED)
+        .value("FAILED", TaskState::FAILED)
         .value("CONSUMED", TaskState::CONSUMED);
-
-    // --- SubmitResult ---
-    nb::class_<SubmitResult>(m, "SubmitResult").def_prop_ro("task_slot", [](const SubmitResult &r) {
-        return r.task_slot;
-    });
 
     // --- Orchestrator (DAG builder, exposed via Worker.get_orchestrator()) ---
     // Bound as `_Orchestrator` because the Python user-facing `Orchestrator`
@@ -104,37 +259,53 @@ inline void bind_worker(nb::module_ &m) {
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
-            [](Orchestrator &self, int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker) {
-                return self.submit_next_level(callable_id, args, config, worker);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const TaskArgs &args, const CallConfig &config, int8_t worker,
+               const std::vector<int32_t> &eligible_endpoint_ids, nb::object remote_sidecar) {
+                self.submit_next_level(
+                    make_callable_identity(digest, kind, target_namespace), args, config, worker, eligible_endpoint_ids,
+                    parse_remote_task_args_sidecar(remote_sidecar)
+                );
             },
-            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
-            "Submit a NEXT_LEVEL (chip) task by registered callable id. "
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"), nb::arg("config"),
+            nb::arg("worker") = int8_t(-1), nb::arg("eligible_endpoint_ids") = std::vector<int32_t>{},
+            nb::arg("remote_sidecar") = nb::none(),
+            "Submit a NEXT_LEVEL task by registered callable digest. "
             "worker= pins to a specific next-level worker (-1 = any)."
         )
         .def(
             "submit_next_level_group",
-            [](Orchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list,
-               const CallConfig &config, const std::vector<int8_t> &workers) {
-                return self.submit_next_level_group(callable_id, args_list, config, workers);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const std::vector<TaskArgs> &args_list, const CallConfig &config, const std::vector<int8_t> &workers,
+               const std::vector<std::vector<int32_t>> &eligible_endpoint_ids, nb::object remote_sidecars) {
+                self.submit_next_level_group(
+                    make_callable_identity(digest, kind, target_namespace), args_list, config, workers,
+                    eligible_endpoint_ids, parse_remote_task_args_sidecars(remote_sidecars)
+                );
             },
-            nb::arg("callable_id"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
-            "Submit a group of NEXT_LEVEL tasks by registered callable id. "
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"), nb::arg("config"),
+            nb::arg("workers") = std::vector<int8_t>{},
+            nb::arg("eligible_endpoint_ids") = std::vector<std::vector<int32_t>>{},
+            nb::arg("remote_sidecars") = nb::none(),
+            "Submit a group of NEXT_LEVEL tasks by registered callable digest. "
             "workers= per-args affinity (empty = any)."
         )
         .def(
             "submit_sub",
-            [](Orchestrator &self, int32_t callable_id, const TaskArgs &args) {
-                return self.submit_sub(callable_id, args);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const TaskArgs &args) {
+                self.submit_sub(make_callable_identity(digest, kind, target_namespace), args);
             },
-            nb::arg("callable_id"), nb::arg("args"),
-            "Submit a SUB task by registered callable id. Tags drive dependency inference."
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"),
+            "Submit a SUB task by registered callable digest. Tags drive dependency inference."
         )
         .def(
             "submit_sub_group",
-            [](Orchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list) {
-                return self.submit_sub_group(callable_id, args_list);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const std::vector<TaskArgs> &args_list) {
+                self.submit_sub_group(make_callable_identity(digest, kind, target_namespace), args_list);
             },
-            nb::arg("callable_id"), nb::arg("args_list"),
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"),
             "Submit a group of SUB tasks: N args -> N workers, 1 DAG node."
         )
         .def(
@@ -171,7 +342,7 @@ inline void bind_worker(nb::module_ &m) {
                 return self.alloc(shape, dtype);
             },
             nb::arg("shape"), nb::arg("dtype"),
-            "Allocate an intermediate ContinuousTensor from the orchestrator's MAP_SHARED "
+            "Allocate an intermediate Tensor from the orchestrator's MAP_SHARED "
             "pool (visible to forked child workers). Lifetime: until the next Worker.run() call."
         )
         .def(
@@ -220,6 +391,20 @@ inline void bind_worker(nb::module_ &m) {
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _sub_worker_loop)."
         )
+        .def(
+            "add_remote_l3_socket",
+            [](Worker &self, int32_t endpoint_id, uint64_t session_id, const std::string &transport_name,
+               const std::string &host, uint16_t port, const std::string &health_host, uint16_t health_port,
+               double timeout_s) {
+                nb::gil_scoped_release release;
+                self.add_remote_l3_socket(
+                    endpoint_id, session_id, transport_name, host, port, health_host, health_port, timeout_s
+                );
+            },
+            nb::arg("endpoint_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("host"), nb::arg("port"),
+            nb::arg("health_host"), nb::arg("health_port"), nb::arg("timeout_s") = 30.0,
+            "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
+        )
 
         .def("init", &Worker::init, "Start the Scheduler thread.")
         .def("close", &Worker::close, "Stop the Scheduler thread.")
@@ -235,45 +420,279 @@ inline void bind_worker(nb::module_ &m) {
         // Release the GIL during the spin-poll wait so other Python threads
         // (e.g. a concurrent Worker.run) can keep running.
         .def(
-            "control_prepare", &Worker::control_prepare, nb::arg("worker_id"), nb::arg("cid"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Prewarm a NEXT_LEVEL child for `cid` by sending CTRL_PREPARE. "
-            "Blocks until the child publishes CONTROL_DONE."
+            "control_prepare",
+            [](Worker &self, int worker_id, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                self.control_prepare(worker_id, reinterpret_cast<const uint8_t *>(digest_bytes.data()));
+            },
+            nb::arg("worker_id"), nb::arg("digest"), "Prewarm a NEXT_LEVEL child by callable digest."
         )
         .def(
-            "broadcast_register_all", &Worker::broadcast_register_all, nb::arg("cid"), nb::arg("blob_ptr"),
-            nb::arg("blob_size"), nb::call_guard<nb::gil_scoped_release>(),
+            "broadcast_register_all",
+            [](Worker &self, uint64_t blob_ptr, uint64_t blob_size, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.broadcast_register_all(
+                    blob_ptr, blob_size, reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                );
+            },
+            nb::arg("blob_ptr"), nb::arg("blob_size"), nb::arg("digest"),
             "Stage `blob_size` bytes from `blob_ptr` into a POSIX shm and broadcast "
-            "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Throws on any failure."
+            "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Returns per-child status."
         )
         .def(
-            "broadcast_unregister_all", &Worker::broadcast_unregister_all, nb::arg("cid"),
-            nb::call_guard<nb::gil_scoped_release>(),
+            "control_digest_only",
+            [](Worker &self, WorkerType worker_type, int worker_id, uint64_t sub_cmd, nb::object digest,
+               nb::object timeout_s) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
+                nb::gil_scoped_release release;
+                return self.control_digest_only(
+                    worker_type, worker_id, sub_cmd, reinterpret_cast<const uint8_t *>(digest_bytes.data()), timeout_val
+                );
+            },
+            nb::arg("worker_type"), nb::arg("worker_id"), nb::arg("sub_cmd"), nb::arg("digest"),
+            nb::arg("timeout_s") = nb::none(),
+            "Drive one selected worker through a digest-only CONTROL_REQUEST. "
+            "Used by registration cleanup after partial broadcast failures."
+        )
+        .def(
+            "remote_prepare_register",
+            [](Worker &self, int endpoint_id, const std::string &target_registry, const std::string &kind,
+               nb::object payload, nb::object digest) {
+                std::string payload_bytes;
+                if (!payload.is_none()) {
+                    payload_bytes = buffer_to_string(payload, "payload");
+                }
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.remote_prepare_register(
+                    endpoint_id, parse_remote_registry_target(target_registry), parse_callable_kind(kind),
+                    payload_bytes.data(), payload_bytes.size(), reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                );
+            },
+            nb::arg("endpoint_id"), nb::arg("target_registry"), nb::arg("kind"), nb::arg("payload"), nb::arg("digest"),
+            "Send PREPARE_REGISTER_CALLABLE to one remote endpoint."
+        )
+        .def(
+            "remote_commit_register",
+            [](Worker &self, int endpoint_id, const std::string &target_registry, const std::string &kind,
+               nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.remote_commit_register(
+                    endpoint_id, parse_remote_registry_target(target_registry), parse_callable_kind(kind),
+                    reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                );
+            },
+            nb::arg("endpoint_id"), nb::arg("target_registry"), nb::arg("kind"), nb::arg("digest"),
+            "Send COMMIT_REGISTER_CALLABLE to one remote endpoint."
+        )
+        .def(
+            "remote_abort_register",
+            [](Worker &self, int endpoint_id, const std::string &target_registry, const std::string &kind,
+               nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.remote_abort_register(
+                    endpoint_id, parse_remote_registry_target(target_registry), parse_callable_kind(kind),
+                    reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                );
+            },
+            nb::arg("endpoint_id"), nb::arg("target_registry"), nb::arg("kind"), nb::arg("digest"),
+            "Send ABORT_REGISTER_CALLABLE to one remote endpoint."
+        )
+        .def(
+            "remote_unregister",
+            [](Worker &self, int endpoint_id, const std::string &target_registry, const std::string &kind,
+               nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.remote_unregister(
+                    endpoint_id, parse_remote_registry_target(target_registry), parse_callable_kind(kind),
+                    reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                );
+            },
+            nb::arg("endpoint_id"), nb::arg("target_registry"), nb::arg("kind"), nb::arg("digest"),
+            "Send UNREGISTER_CALLABLE to one remote endpoint."
+        )
+        .def(
+            "remote_malloc",
+            [](Worker &self, int endpoint_id, size_t size) {
+                RemoteBufferHandle h;
+                {
+                    nb::gil_scoped_release release;
+                    h = self.remote_malloc(endpoint_id, size);
+                }
+                return nb::make_tuple(
+                    h.endpoint_id, h.buffer_id, h.generation, static_cast<int32_t>(h.address_space), h.nbytes,
+                    h.remote_addr, h.rkey_or_token, h.ub_ldst_va
+                );
+            },
+            nb::arg("endpoint_id"), nb::arg("size"), "Allocate a remote buffer and return handle fields."
+        )
+        .def(
+            "remote_free",
+            [](Worker &self, int endpoint_id, uint64_t buffer_id, uint64_t generation) {
+                RemoteBufferHandle h;
+                h.endpoint_id = endpoint_id;
+                h.buffer_id = buffer_id;
+                h.generation = generation;
+                nb::gil_scoped_release release;
+                self.remote_free(h);
+            },
+            nb::arg("endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), "Free a remote buffer."
+        )
+        .def(
+            "remote_copy_to",
+            [](Worker &self, int endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t offset, uint64_t src,
+               size_t size, uint64_t handle_nbytes) {
+                RemoteBufferHandle h;
+                h.endpoint_id = endpoint_id;
+                h.buffer_id = buffer_id;
+                h.generation = generation;
+                h.nbytes = validated_handle_nbytes(handle_nbytes, "remote_copy_to", 0, offset, size);
+                nb::gil_scoped_release release;
+                self.remote_copy_to(h, offset, reinterpret_cast<const void *>(src), size);
+            },
+            nb::arg("endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), nb::arg("offset"), nb::arg("src"),
+            nb::arg("size"), nb::arg("handle_nbytes"), "Copy host bytes into a remote buffer."
+        )
+        .def(
+            "remote_copy_from",
+            [](Worker &self, uint64_t dst, int endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t offset,
+               size_t size, uint64_t handle_nbytes) {
+                RemoteBufferHandle h;
+                h.endpoint_id = endpoint_id;
+                h.buffer_id = buffer_id;
+                h.generation = generation;
+                h.nbytes = validated_handle_nbytes(handle_nbytes, "remote_copy_from", 0, offset, size);
+                nb::gil_scoped_release release;
+                self.remote_copy_from(reinterpret_cast<void *>(dst), h, offset, size);
+            },
+            nb::arg("dst"), nb::arg("endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), nb::arg("offset"),
+            nb::arg("size"), nb::arg("handle_nbytes"), "Copy remote buffer bytes into host memory."
+        )
+        .def(
+            "remote_export",
+            [](Worker &self, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t handle_offset,
+               uint64_t offset, uint64_t size, uint32_t access_flags, const std::string &transport_profile,
+               uint64_t handle_nbytes) {
+                RemoteBufferHandle h;
+                h.endpoint_id = owner_endpoint_id;
+                h.owner_endpoint_id = owner_endpoint_id;
+                h.buffer_id = buffer_id;
+                h.generation = generation;
+                h.offset = handle_offset;
+                h.nbytes = validated_handle_nbytes(handle_nbytes, "remote_export", handle_offset, offset, size);
+                RemoteBufferExport e;
+                {
+                    nb::gil_scoped_release release;
+                    e = self.remote_export(h, offset, size, access_flags, transport_profile);
+                }
+                return nb::make_tuple(
+                    e.owner_endpoint_id, e.buffer_id, e.generation, static_cast<int32_t>(e.address_space), e.offset,
+                    e.nbytes, e.export_id, e.remote_addr, e.rkey_or_token, e.ub_ldst_va, e.access_flags,
+                    e.transport_profile,
+                    nb::bytes(
+                        reinterpret_cast<const char *>(e.transport_descriptor.data()), e.transport_descriptor.size()
+                    )
+                );
+            },
+            nb::arg("owner_endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), nb::arg("handle_offset"),
+            nb::arg("offset"), nb::arg("size"), nb::arg("access_flags"), nb::arg("transport_profile"),
+            nb::arg("handle_nbytes"), "Export a remote buffer range and return export descriptor fields."
+        )
+        .def(
+            "remote_import",
+            [](Worker &self, int importer_endpoint_id, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation,
+               int address_space, uint64_t offset, uint64_t size, uint64_t export_id, uint64_t remote_addr,
+               uint64_t rkey_or_token, uint64_t ub_ldst_va, uint32_t access_flags, const std::string &transport_profile,
+               nb::object transport_descriptor, uint32_t requested_access_flags) {
+                RemoteBufferExport e;
+                e.owner_endpoint_id = owner_endpoint_id;
+                e.buffer_id = buffer_id;
+                e.generation = generation;
+                e.address_space = parse_remote_address_space(nb::int_(address_space));
+                e.offset = offset;
+                e.nbytes = size;
+                e.export_id = export_id;
+                e.remote_addr = remote_addr;
+                e.rkey_or_token = rkey_or_token;
+                e.ub_ldst_va = ub_ldst_va;
+                e.access_flags = access_flags;
+                e.transport_profile = transport_profile;
+                e.transport_descriptor = bytes_to_u8_vector(transport_descriptor, "transport_descriptor");
+                RemoteBufferHandle h;
+                {
+                    nb::gil_scoped_release release;
+                    h = self.remote_import(importer_endpoint_id, e, requested_access_flags);
+                }
+                return nb::make_tuple(
+                    h.endpoint_id, h.owner_endpoint_id, h.buffer_id, h.generation, h.import_id,
+                    static_cast<int32_t>(h.address_space), h.nbytes, h.offset, h.remote_addr, h.rkey_or_token,
+                    h.ub_ldst_va, h.access_flags
+                );
+            },
+            nb::arg("importer_endpoint_id"), nb::arg("owner_endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"),
+            nb::arg("address_space"), nb::arg("offset"), nb::arg("size"), nb::arg("export_id"), nb::arg("remote_addr"),
+            nb::arg("rkey_or_token"), nb::arg("ub_ldst_va"), nb::arg("access_flags"), nb::arg("transport_profile"),
+            nb::arg("transport_descriptor"), nb::arg("requested_access_flags"),
+            "Import a remote buffer export into an endpoint."
+        )
+        .def(
+            "remote_release_import",
+            [](Worker &self, int importer_endpoint_id, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation,
+               uint64_t import_id) {
+                RemoteBufferHandle h;
+                h.endpoint_id = importer_endpoint_id;
+                h.owner_endpoint_id = owner_endpoint_id;
+                h.buffer_id = buffer_id;
+                h.generation = generation;
+                h.import_id = import_id;
+                nb::gil_scoped_release release;
+                self.remote_release_import(h);
+            },
+            nb::arg("importer_endpoint_id"), nb::arg("owner_endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"),
+            nb::arg("import_id"), "Release an imported remote buffer mapping."
+        )
+        .def(
+            "broadcast_unregister_all",
+            [](Worker &self, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.broadcast_unregister_all(reinterpret_cast<const uint8_t *>(digest_bytes.data()));
+            },
+            nb::arg("digest"),
             "Best-effort broadcast of CTRL_UNREGISTER to every NEXT_LEVEL child in parallel. "
             "Returns a list of per-child error strings (empty on full success)."
         )
         .def(
             "broadcast_control_all",
-            [](Worker &self, WorkerType worker_type, uint64_t sub_cmd, int32_t cid, nb::object payload,
+            [](Worker &self, WorkerType worker_type, uint64_t sub_cmd, nb::object payload, nb::object digest,
                nb::object timeout_s) {
                 std::string payload_bytes;
                 const void *payload_ptr = nullptr;
                 size_t payload_size = 0;
                 if (!payload.is_none()) {
-                    Py_buffer view;
-                    if (PyObject_GetBuffer(payload.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
-                        throw nb::python_error();
-                    }
-                    payload_bytes.assign(static_cast<const char *>(view.buf), static_cast<size_t>(view.len));
-                    PyBuffer_Release(&view);
+                    payload_bytes = buffer_to_string(payload, "payload");
                     payload_ptr = payload_bytes.data();
                     payload_size = payload_bytes.size();
                 }
+                std::string digest_bytes;
+                const uint8_t *digest_ptr = nullptr;
+                if (!digest.is_none()) {
+                    digest_bytes = bytes_from_digest_arg(digest);
+                    digest_ptr = reinterpret_cast<const uint8_t *>(digest_bytes.data());
+                }
                 double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
                 nb::gil_scoped_release release;
-                return self.broadcast_control_all(worker_type, sub_cmd, cid, payload_ptr, payload_size, timeout_val);
+                return self.broadcast_control_all(
+                    worker_type, sub_cmd, payload_ptr, payload_size, digest_ptr, timeout_val
+                );
             },
-            nb::arg("worker_type"), nb::arg("sub_cmd"), nb::arg("cid"), nb::arg("payload") = nb::none(),
+            nb::arg("worker_type"), nb::arg("sub_cmd"), nb::arg("payload") = nb::none(), nb::arg("digest") = nb::none(),
             nb::arg("timeout_s") = nb::none(),
             "Broadcast an arbitrary CONTROL_REQUEST to the selected worker pool. "
             "If payload is a Python buffer, C++ stages it in POSIX shm and writes the shm name "

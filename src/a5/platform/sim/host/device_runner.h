@@ -42,7 +42,7 @@ private:
     int ensure_binaries_loaded() override;
     void unload_executor_binaries();
 
-    int init_l2_swimlane(int num_aicore, int device_id);
+    int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
     int init_tensor_dump(Runtime &runtime, int device_id);
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     int init_scope_stats(int num_threads);
@@ -60,7 +60,7 @@ private:
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
-    void (*set_dump_tensor_enabled_func_)(bool){nullptr};
+    void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_l2_swimlane_base_func_)(uint64_t){nullptr};
     void (*set_l2_swimlane_enabled_func_)(bool){nullptr};
     void (*set_pmu_enabled_func_)(bool){nullptr};

@@ -20,10 +20,10 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -112,7 +112,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
         device_ids=device_ids,
         num_sub_workers=0,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
     try:
         worker.init()
 
@@ -130,7 +130,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
                     args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
                     args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
                     args.add_tensor(
-                        ContinuousTensor.make(
+                        Tensor.make(
                             data=domain.buffer_ptrs["notify_counter"],
                             shapes=(1,),
                             dtype=DataType.INT32,
@@ -139,7 +139,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
                         TensorArgType.INPUT,
                     )
                     args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_cid, args, cfg, worker=rank)
+                    orch.submit_next_level(chip_handle, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
 

@@ -19,8 +19,8 @@ Pipeline (what the @scene_test framework normally does for you):
     host arrays ──[worker.malloc + copy_to]──►  device buffers
                                           │
                                           ▼
-                       chip_cid = worker.register(chip_callable)  # before init()
-                              worker.run(chip_cid, task_args, cfg)
+                    chip_handle = worker.register(chip_callable)  # before init()
+                              worker.run(chip_handle, task_args, cfg)
                                           │
     device result ──[worker.copy_from]──► host array ──[torch compare]
 
@@ -38,14 +38,15 @@ import sys
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch  # noqa: E402
+from simpler.callable_identity import CallableHandle
 from simpler.task_interface import (
     ArgDirection,
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
-    ContinuousTensor,
     CoreCallable,
     DataType,
+    Tensor,
 )
 from simpler.worker import Worker
 
@@ -127,7 +128,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def _run(worker: Worker, chip_cid: int):
+def _run(worker: Worker, chip_handle: CallableHandle):
     """Allocate device memory, copy inputs, execute, copy outputs back, verify."""
     # --- 1. Prepare host arrays ---
     torch.manual_seed(42)
@@ -145,17 +146,17 @@ def _run(worker: Worker, chip_cid: int):
     worker.copy_to(dev_b, host_b.data_ptr(), NBYTES)
 
     # --- 3. Build TaskArgs describing the tensors visible to the orchestration ---
-    # Each tensor is a ContinuousTensor(data_ptr, shape, dtype). Order must
+    # Each tensor is a Tensor(data_ptr, shape, dtype). Order must
     # match the ``signature`` list in the ChipCallable (IN, IN, OUT).
     args = ChipStorageTaskArgs()
-    args.add_tensor(ContinuousTensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
-    args.add_tensor(ContinuousTensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
-    args.add_tensor(ContinuousTensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
+    args.add_tensor(Tensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
+    args.add_tensor(Tensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
+    args.add_tensor(Tensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
 
     # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
     config = CallConfig()
     print("[vector_add] running on device...")
-    timing = worker.run(chip_cid, args, config)
+    timing = worker.run(chip_handle, args, config)
     print(f"[vector_add] {timing}")
 
     # --- 5. D2H copy back + verify ---
@@ -186,12 +187,12 @@ def run(platform: str, device_id: int) -> int:
     chip_callable = build_chip_callable(platform)
     print(f"[vector_add] compiled. binary_size={chip_callable.binary_size} bytes")
 
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
 
     print(f"[vector_add] init worker (device={device_id})...")
     worker.init()
     try:
-        _run(worker, chip_cid)
+        _run(worker, chip_handle)
     finally:
         worker.close()
     return 0

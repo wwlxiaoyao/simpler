@@ -19,6 +19,7 @@ from __future__ import annotations
 import faulthandler
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -49,7 +50,7 @@ if sys.platform == "darwin":
 import pytest  # noqa: E402
 
 from simpler_setup import parallel_scheduler as _ps  # noqa: E402
-from simpler_setup.log_config import configure_logging  # noqa: E402
+from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 from simpler_setup.scene_test import clear_compile_cache  # noqa: E402
 
@@ -147,13 +148,22 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
-        "--dump-tensor",
+        "--enable-device-log-timing",
+        action="store_true",
+        default=False,
+        help="After the run, parse the CANN device log and print per-round Total / Orch / "
+        "Sched timing (from PTO2_PROFILING markers; no swimlane needed). Works with --rounds N. "
+        "Onboard only — ignored on sim and L3.",
+    )
+    parser.addoption(
+        "--dump-args",
         nargs="?",
         const=1,
         type=int,
         default=0,
-        help="Dump per-task tensor I/O at runtime. Level: 0=off, 1=partial (only "
-        "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks).",
+        help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
+        "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks), "
+        "3=full_json_only (all tasks, JSON metadata only, no .bin payload).",
     )
     parser.addoption(
         "--enable-dep-gen",
@@ -178,17 +188,25 @@ def pytest_addoption(parser):
         help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
     )
     parser.addoption(
+        "--enable-swimlane-overhead",
+        action="store_true",
+        default=False,
+        help="Add the 8 Overhead Analysis counter tracks (per-engine "
+        "idle/ready/overhead + system all/has overhead) to the swimlane JSON. "
+        "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
+    )
+    parser.addoption(
         "--pto-isa-commit",
         action="store",
         default=None,
-        help="Pin pto-isa clone to this commit before running tests",
+        help=("Override the pto-isa revision before running tests. Default/latest: use the current checkout HEAD."),
     )
     parser.addoption(
         "--clone-protocol",
         action="store",
         default="ssh",
         choices=["ssh", "https"],
-        help="Protocol for cloning pto-isa when --pto-isa-commit is set",
+        help="Protocol for cloning pto-isa when PTO_ISA_ROOT is not already set",
     )
     parser.addoption(
         "--sanitizer",
@@ -417,16 +435,21 @@ def pytest_configure(config):
 
     _configure_sanitizer(config)
 
+    # Configure logging unconditionally (not only when --log-level is passed) so
+    # simpler's own WARNINGs — e.g. the device-log-timing "no device log written"
+    # diagnostic — reach stderr by default under pytest, matching the standalone
+    # CLI path. Without this the root logger has no handler, so pytest's log
+    # capture swallows the message and a passing run shows nothing. An explicit
+    # --log-level still overrides the default threshold.
     log_level = config.getoption("--log-level", default=None)
-    if log_level:
-        configure_logging(log_level)
+    configure_logging(log_level or DEFAULT_LOG_LEVEL)
 
     commit = config.getoption("--pto-isa-commit")
     clone_protocol = config.getoption("--clone-protocol")
     # Pre-clone / refresh PTO-ISA up front so that (a) the requested
     # --clone-protocol is honored before SceneTestCase's lazy default-ssh
     # resolve, and (b) the local clone is fetched to origin/HEAD so a
-    # --pto-isa-commit request doesn't miss a recently-published commit.
+    # requested/default pto-isa commit doesn't miss a recently-published object.
     # Short-circuits when $PTO_ISA_ROOT already points to a user-managed clone.
     #
     # Pre-clone is an optimization, not a requirement: jobs that don't actually
@@ -960,6 +983,105 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
 
 
 # ---------------------------------------------------------------------------
+# L2 worker-pool self-healing
+#
+# The L2 ``st_worker`` pool hands ONE ``ChipWorker`` to every SceneTestCase on
+# a (runtime, device) for the life of an xdist worker process. That amortizes
+# init cost, but it also means a single device-runtime error (an AICore
+# op-timeout reaped by STARS, or a kernel-launch failure) poisons the shared
+# ACL/device context: every later test on that worker then fails at
+# ``halResMap`` (rc=62) / ``rtMalloc`` (507899) — one failure cascades into the
+# whole worker's remaining tests. The driver-side guard
+# (``DeviceRunner::run`` fail-fast on ``device_unusable_``) keeps that cascade
+# from wedging, but the Worker stays poisoned.
+#
+# On a5 the poison survives close()+device-reset for the life of the process
+# (an in-process Worker.init rebuild fails with rtStreamCreate 507899; a
+# force-reset is unsafe on this shared box), so there is no in-process
+# recovery — only a fresh worker process gets a clean device. The hook below
+# stashes the call-phase exception so the ``st_worker`` finalizer can, after
+# — and ONLY after — a device-runtime error, drop the pooled Worker; the L2
+# branch then rebuilds where the arch allows it and otherwise skips the
+# remaining tests for that runtime (``_l2_poisoned``). Golden mismatches /
+# ordinary assertions leave the Worker reusable.
+# ---------------------------------------------------------------------------
+
+# Plain attribute name on the test item — NOT pytest.StashKey()/item.stash,
+# which are pytest>=7.0 only; the test extra pins `pytest>=6.0`, and StashKey
+# at import time would AttributeError on pytest 6.x.
+_ST_CALL_EXCINFO = "_st_call_excinfo"
+
+
+# hookwrapper (not the 8.0+ `wrapper=True`) so this works across the whole
+# declared pytest range (test extra pins only `pytest>=6.0`). We stash
+# call.excinfo for the side effect and don't touch the result.
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    yield
+    if call.when == "call":
+        setattr(item, _ST_CALL_EXCINFO, call.excinfo)
+
+
+# Only these error codes mean the device/ACL context is sticky-errored — i.e.
+# the worker is poisoned and must be rebuilt/skipped. Matching on the bare
+# "<op> failed with code" prefix would also catch ordinary kernel/run failures
+# (every non-zero rc is wrapped that way), turning a normal failing test into a
+# spurious worker rebuild and, downstream, a misleading runtime-wide skip. So
+# we extract the trailing <N> and match only the known poison codes:
+#   207001 AICore launch failure (the CI cascade trigger)
+#   507000 ACL_ERROR_RT_INTERNAL_ERROR  (a5 op-timeout at AICPU stream sync)
+#   507018 ACL_ERROR_RT_AICPU_EXCEPTION
+#   507046 ACL_ERROR_RT_STREAM_SYNC_TIMEOUT
+#   507899 sticky-error rtMalloc / rtStreamCreate on the poisoned context
+#       -1 a5 DeviceRunner fail-fast sentinel ("marked unusable; refusing to run")
+# Worker surfaces these as "run_prepared/prepare_callable/simpler_init failed
+# with code <N>" — never as an AssertionError, so golden mismatches are already
+# excluded.
+_DEVICE_POISON_CODES = frozenset({207001, 507000, 507018, 507046, 507899, -1})
+_DEVICE_ERROR_CODE_RE = re.compile(r"(?:run_prepared|prepare_callable|simpler_init) failed with code (-?\d+)")
+
+
+def _is_device_runtime_error_msg(msg: str) -> bool:
+    match = _DEVICE_ERROR_CODE_RE.search(msg)
+    return match is not None and int(match.group(1)) in _DEVICE_POISON_CODES
+
+
+def _is_device_runtime_error(excinfo) -> bool:
+    if excinfo is None or not issubclass(excinfo.type, RuntimeError):
+        return False
+    return _is_device_runtime_error_msg(str(excinfo.value))
+
+
+def _register_l2_pool_heal(request, pool, key):
+    """Drop + close the pooled L2 Worker iff this test raised a device-runtime
+    error, so the next test on this (runtime, device) gets a chance to rebuild a
+    fresh Worker / ACL context instead of inheriting a poisoned one. No-op on
+    pass or on a non-device failure (golden mismatch, assertion).
+
+    NOTE: on a5, an AICore op-timeout poisons the device context for the life of
+    the *process*: an in-process rebuild's Worker.init fails (rtStreamCreate
+    507899), and aclrtResetDeviceForce is unsafe on this shared box (it resets
+    the physical device for other users). So this heal can only *recover* on
+    arches where in-process re-init works; where it cannot, the st_worker L2
+    branch falls back to skipping the remaining tests for that runtime (see
+    _l2_poisoned). Either way one device error stops cascading into a worker-wide
+    storm of confusing 507899 failures."""
+
+    def _heal():
+        if not _is_device_runtime_error(getattr(request.node, _ST_CALL_EXCINFO, None)):
+            return
+        w = pool.pop(key, None)
+        if w is None:
+            return
+        try:
+            w.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    request.addfinalizer(_heal)
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -1004,8 +1126,19 @@ def _l2_worker_pool(request, st_platform):
     pool.clear()
 
 
+@pytest.fixture(scope="session")
+def _l2_poisoned():
+    """Runtimes whose L2 device context was poisoned by a device-runtime error
+    and could not be re-initialized in this process. ``st_worker`` skips
+    remaining tests for a poisoned runtime instead of letting them fail with
+    confusing 507899 cascades. Lives for the xdist worker process; only a fresh
+    process (process exit fully releases the device) recovers — which is exactly
+    how the standalone phase + a new xdist worker get a clean device."""
+    return set()
+
+
 @pytest.fixture()
-def st_worker(request, st_platform, device_pool, _l2_worker_pool):
+def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
     """Per-test Worker.
 
     L2: session-scoped, reused across classes with the same (runtime, device).
@@ -1019,6 +1152,18 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
     runtime = cls._st_runtime
 
     if level == 2:
+        # A prior test on this runtime poisoned the device and the rebuild below
+        # could not re-init it in-process (a5 op-timeout: rtStreamCreate 507899).
+        # Skip the rest for this runtime so one device error stops cascading —
+        # the triggering failure is already reported; a fresh worker process is
+        # the only real recovery.
+        if runtime in _l2_poisoned:
+            pytest.skip(
+                f"L2 device context for runtime '{runtime}' was poisoned by an earlier device-runtime error on "
+                f"this worker process and cannot be re-initialized in-process; skipping to avoid a misleading "
+                f"507899 cascade (a fresh worker process recovers)."
+            )
+
         # L2 share: reuse any Worker already created for this runtime in the
         # current process. Under xdist, each worker process is sliced to a
         # single device so there's at most one matching entry. On first call
@@ -1029,6 +1174,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
         # same xdist worker.
         for (rt, dev_id), existing in _l2_worker_pool.items():
             if rt == runtime:
+                _register_l2_pool_heal(request, _l2_worker_pool, (rt, dev_id))
                 yield existing
                 return
 
@@ -1042,10 +1188,32 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
 
         w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime)
         w._st_device_id = dev_id
-        w.init()
+        # First rebuild after a poison-and-heal lands here. On arches where the
+        # device re-inits cleanly this just works; on a5 the op-timeout poison
+        # survives close()+reset, so Worker.init raises a device-runtime error —
+        # mark the runtime poisoned and skip (this test and every later one for
+        # the runtime) instead of surfacing a raw 507899 setup ERROR.
+        try:
+            w.init()
+        except RuntimeError as e:
+            if _is_device_runtime_error_msg(str(e)):
+                _l2_poisoned.add(runtime)
+                try:
+                    w.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                pytest.skip(
+                    f"L2 Worker.init for runtime '{runtime}' failed with a device-runtime error ({e}); the device "
+                    f"context is not recoverable in-process after an earlier AICore error — skipping remaining "
+                    f"'{runtime}' L2 tests (a fresh worker process recovers)."
+                )
+            raise
         _l2_worker_pool[key] = w
+        _register_l2_pool_heal(request, _l2_worker_pool, key)
         yield w
-        # No close here — pool handles teardown at session end.
+        # No close here on success — the pool handles teardown at session end.
+        # On a device-runtime failure, the finalizer registered above closes
+        # this Worker and drops it from the pool so the next test rebuilds.
 
     elif level == 3:
         max_devices = max((c.get("config", {}).get("device_count", 1) for c in cls.CASES), default=1)
@@ -1068,23 +1236,23 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 
         # Register SubCallable entries from cls.CALLABLE
-        sub_ids = {}
-        chip_cids = {}
+        sub_handles = {}
+        chip_handles = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
-                cid = w.register(entry["callable"])
-                sub_ids[entry["name"]] = cid
+                handle = w.register(entry["callable"])
+                sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 from simpler_setup.scene_test import _compile_chip_callable_from_spec  # noqa: PLC0415
 
                 name = entry["name"]
                 cache_key = (cls.__qualname__, name, st_platform, runtime)
                 chip = _compile_chip_callable_from_spec(entry, st_platform, runtime, cache_key)
-                cid = w.register(chip)
-                chip_cids[name] = cid
-                chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
-        cls._st_sub_ids = sub_ids
-        cls._st_chip_cids = chip_cids
+                handle = w.register(chip)
+                chip_handles[name] = handle
+                chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])
+        cls._st_sub_handles = sub_handles
+        cls._st_chip_handles = chip_handles
 
         w.init()
         yield w

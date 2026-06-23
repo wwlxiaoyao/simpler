@@ -39,10 +39,10 @@ from simpler.task_interface import (  # noqa: E402
     ChipCallable,
     ChipDomainContext,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -155,7 +155,7 @@ def _scratch_buffers() -> list[CommBufferSpec]:
 
 def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
     args.add_tensor(
-        ContinuousTensor.make(
+        Tensor.make(
             data=domain.buffer_ptrs["scratch"],
             shapes=(COUNT,),
             dtype=DataType.FLOAT32,
@@ -192,8 +192,8 @@ def run(platform: str, device_ids: list[int]) -> int:
         device_ids=device_ids,
         num_sub_workers=0,
     )
-    allreduce_cid = worker.register(allreduce_cc)
-    affine_cid = worker.register(affine_cc)
+    allreduce_handle = worker.register(allreduce_cc)
+    affine_handle = worker.register(affine_cc)
 
     try:
         print("[dual_domain_overlap] init worker...")
@@ -221,7 +221,7 @@ def run(platform: str, device_ids: list[int]) -> int:
                             make_tensor_arg(reduce_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING
                         )
                         _add_domain_scratch(args, domain)
-                        orch.submit_next_level(allreduce_cid, args, cfg, worker=worker_idx)
+                        orch.submit_next_level(allreduce_handle, args, cfg, worker=worker_idx)
 
             return _orch_fn
 
@@ -235,7 +235,7 @@ def run(platform: str, device_ids: list[int]) -> int:
                     args.add_tensor(make_tensor_arg(bias[worker_idx]), TensorArgType.INPUT)
                     args.add_tensor(make_tensor_arg(affine_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING)
                     args_list.append(args)
-                orch.submit_next_level_group(affine_cid, args_list, cfg, workers=worker_indices)
+                orch.submit_next_level_group(affine_handle, args_list, cfg, workers=worker_indices)
 
         print("[dual_domain_overlap] running two-domain DAG...")
         for domain_name in DOMAINS:

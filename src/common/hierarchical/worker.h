@@ -76,6 +76,13 @@ public:
     // child and consumes the mailbox via the Python child loop.
     void add_worker(WorkerType type, void *mailbox);
 
+    // Register a REMOTE_L3 endpoint only after its session runner completed
+    // prestart and reported HELLO READY on the command lane.
+    void add_remote_l3_socket(
+        int32_t endpoint_id, uint64_t session_id, const std::string &transport_name, const std::string &host,
+        uint16_t port, const std::string &health_host, uint16_t health_port, double timeout_s
+    );
+
     // Start the scheduler thread. Must be called AFTER the parent has forked
     // any child workers — init() spins up threads in the parent that would
     // otherwise be accidentally inherited across fork.
@@ -90,7 +97,7 @@ public:
 
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker (prewarm path
     // used by the Python facade at end of _start_hierarchical).
-    void control_prepare(int worker_id, int32_t cid) { manager_.control_prepare(worker_id, cid); }
+    void control_prepare(int worker_id, const uint8_t *digest) { manager_.control_prepare(worker_id, digest); }
 
     // Drive a single chip child through one CommDomain alloc / release.  The
     // Python orch facade is expected to call this on every participating chip
@@ -106,19 +113,77 @@ public:
         manager_.control_comm_init(worker_id, request_shm_name.c_str());
     }
 
-    // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable cid to
+    ControlResult
+    control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s) {
+        return manager_.control_digest_only(type, worker_id, sub_cmd, digest, timeout_s);
+    }
+    ControlResult remote_prepare_register(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const void *payload, size_t payload_size, const uint8_t *digest
+    ) {
+        return manager_.control_remote_prepare_register(
+            endpoint_id, target_registry, callable_kind, payload, payload_size, digest
+        );
+    }
+    ControlResult remote_commit_register(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const uint8_t *digest
+    ) {
+        return manager_.control_remote_commit_register(endpoint_id, target_registry, callable_kind, digest);
+    }
+    ControlResult remote_abort_register(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const uint8_t *digest
+    ) {
+        return manager_.control_remote_abort_register(endpoint_id, target_registry, callable_kind, digest);
+    }
+    ControlResult remote_unregister(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const uint8_t *digest
+    ) {
+        return manager_.control_remote_unregister(endpoint_id, target_registry, callable_kind, digest);
+    }
+    RemoteBufferHandle remote_malloc(int endpoint_id, size_t size) {
+        return manager_.control_remote_malloc(endpoint_id, size);
+    }
+    void remote_free(const RemoteBufferHandle &handle) { manager_.control_remote_free(handle); }
+    void remote_copy_to(const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size) {
+        manager_.control_remote_copy_to(handle, offset, src, size);
+    }
+    void remote_copy_from(void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size) {
+        manager_.control_remote_copy_from(dst, handle, offset, size);
+    }
+    RemoteBufferExport remote_export(
+        const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
+        const std::string &transport_profile
+    ) {
+        return manager_.control_remote_export(handle, offset, size, access_flags, transport_profile);
+    }
+    RemoteBufferHandle remote_import(
+        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    ) {
+        return manager_.control_remote_import(importer_endpoint_id, export_desc, requested_access_flags);
+    }
+    void remote_release_import(const RemoteBufferHandle &handle) { manager_.control_remote_release_import(handle); }
+
+    // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable digest to
     // every NEXT_LEVEL child in parallel. `blob_ptr`/`blob_size` describe
     // the contiguous ChipCallable bytes (see PyChipCallable::buffer_ptr /
-    // buffer_size). Throws on any child error for register; unregister is
-    // best-effort and returns the per-child error list.
-    void broadcast_register_all(int32_t cid, uint64_t blob_ptr, uint64_t blob_size) {
-        manager_.broadcast_register_all(cid, reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size));
+    // buffer_size). Register returns per-child status so the facade can
+    // reverse only confirmed installs; unregister remains best-effort.
+    std::vector<ControlResult> broadcast_register_all(uint64_t blob_ptr, uint64_t blob_size, const uint8_t *digest) {
+        return manager_.broadcast_register_all(
+            reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size), digest
+        );
     }
-    std::vector<std::string> broadcast_unregister_all(int32_t cid) { return manager_.broadcast_unregister_all(cid); }
+    std::vector<std::string> broadcast_unregister_all(const uint8_t *digest) {
+        return manager_.broadcast_unregister_all(digest);
+    }
     std::vector<ControlResult> broadcast_control_all(
-        WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+        WorkerType type, uint64_t sub_cmd, const void *payload, size_t payload_size, const uint8_t *digest,
+        double timeout_s
     ) {
-        return manager_.broadcast_control_all(type, sub_cmd, cid, payload, payload_size, timeout_s);
+        return manager_.broadcast_control_all(type, sub_cmd, payload, payload_size, digest, timeout_s);
     }
 
 private:

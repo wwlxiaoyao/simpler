@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -23,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ring.h"
@@ -39,13 +41,92 @@ std::string read_error_msg(const char *mbox) {
     return std::string(buf);
 }
 
+std::string format_digest(const uint8_t *digest) {
+    if (digest == nullptr) return "sha256:<null>";
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out = "sha256:";
+    out.reserve(71);
+    for (size_t i = 0; i < CALLABLE_HASH_DIGEST_SIZE; ++i) {
+        uint8_t v = digest[i];
+        out.push_back(kHex[v >> 4]);
+        out.push_back(kHex[v & 0x0F]);
+    }
+    return out;
+}
+
 }  // namespace
 
+namespace {
+
+[[noreturn]] void throw_unsupported_control(const char *op_name) {
+    throw std::runtime_error(std::string(op_name) + " is not supported by this WorkerEndpoint");
+}
+
+}  // namespace
+
+uint64_t WorkerEndpoint::control_malloc(size_t) { throw_unsupported_control("control_malloc"); }
+void WorkerEndpoint::control_free(uint64_t) { throw_unsupported_control("control_free"); }
+void WorkerEndpoint::control_copy_to(uint64_t, uint64_t, size_t) { throw_unsupported_control("control_copy_to"); }
+void WorkerEndpoint::control_copy_from(uint64_t, uint64_t, size_t) { throw_unsupported_control("control_copy_from"); }
+void WorkerEndpoint::control_prepare(const uint8_t *) { throw_unsupported_control("control_prepare"); }
+void WorkerEndpoint::control_register(const char *, size_t, const uint8_t *) {
+    throw_unsupported_control("control_register");
+}
+void WorkerEndpoint::control_unregister(const uint8_t *) { throw_unsupported_control("control_unregister"); }
+void WorkerEndpoint::control_remote_prepare_register(
+    remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *, const void *, size_t
+) {
+    throw_unsupported_control("control_remote_prepare_register");
+}
+void WorkerEndpoint::control_remote_commit_register(remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *) {
+    throw_unsupported_control("control_remote_commit_register");
+}
+void WorkerEndpoint::control_remote_abort_register(remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *) {
+    throw_unsupported_control("control_remote_abort_register");
+}
+void WorkerEndpoint::control_remote_unregister(remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *) {
+    throw_unsupported_control("control_remote_unregister");
+}
+RemoteBufferHandle WorkerEndpoint::control_remote_malloc(size_t) { throw_unsupported_control("control_remote_malloc"); }
+void WorkerEndpoint::control_remote_free(const RemoteBufferHandle &) {
+    throw_unsupported_control("control_remote_free");
+}
+void WorkerEndpoint::control_remote_copy_to(const RemoteBufferHandle &, uint64_t, const void *, size_t) {
+    throw_unsupported_control("control_remote_copy_to");
+}
+void WorkerEndpoint::control_remote_copy_from(void *, const RemoteBufferHandle &, uint64_t, size_t) {
+    throw_unsupported_control("control_remote_copy_from");
+}
+RemoteBufferExport
+WorkerEndpoint::control_remote_export(const RemoteBufferHandle &, uint64_t, uint64_t, uint32_t, const std::string &) {
+    throw_unsupported_control("control_remote_export");
+}
+RemoteBufferHandle WorkerEndpoint::control_remote_import(int32_t, const RemoteBufferExport &, uint32_t) {
+    throw_unsupported_control("control_remote_import");
+}
+void WorkerEndpoint::control_remote_release_import(const RemoteBufferHandle &) {
+    throw_unsupported_control("control_remote_release_import");
+}
+void WorkerEndpoint::control_generic(uint64_t, const char *, size_t, double, const uint8_t *) {
+    throw_unsupported_control("control_generic");
+}
+void WorkerEndpoint::control_alloc_domain(const char *, const char *) {
+    throw_unsupported_control("control_alloc_domain");
+}
+void WorkerEndpoint::control_release_domain(const char *) { throw_unsupported_control("control_release_domain"); }
+void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control("control_comm_init"); }
+
 // =============================================================================
-// WorkerThread — mailbox helpers
+// LocalMailboxEndpoint — mailbox helpers
 // =============================================================================
 
-MailboxState WorkerThread::read_mailbox_state() const {
+LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t endpoint_id, void *mailbox) :
+    mailbox_(mailbox) {
+    if (mailbox == nullptr) throw std::invalid_argument("LocalMailboxEndpoint: null mailbox");
+    caps_.endpoint_id = endpoint_id;
+}
+
+MailboxState LocalMailboxEndpoint::read_mailbox_state() const {
     volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(mbox() + MAILBOX_OFF_STATE);
     int32_t v;
 #if defined(__aarch64__)
@@ -59,7 +140,7 @@ MailboxState WorkerThread::read_mailbox_state() const {
     return static_cast<MailboxState>(v);
 }
 
-void WorkerThread::write_mailbox_state(MailboxState s) {
+void LocalMailboxEndpoint::write_mailbox_state(MailboxState s) {
     volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(mbox() + MAILBOX_OFF_STATE);
     int32_t v = static_cast<int32_t>(s);
 #if defined(__aarch64__)
@@ -72,18 +153,21 @@ void WorkerThread::write_mailbox_state(MailboxState s) {
 #endif
 }
 
+void LocalMailboxEndpoint::shutdown_child() { write_mailbox_state(MailboxState::SHUTDOWN); }
+
 // =============================================================================
 // WorkerThread — lifecycle
 // =============================================================================
 
 void WorkerThread::start(
-    Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox
+    Ring *ring, WorkerManager *manager, const std::function<void(WorkerCompletion)> &on_complete,
+    std::unique_ptr<WorkerEndpoint> endpoint
 ) {
-    if (mailbox == nullptr) throw std::invalid_argument("WorkerThread::start: null mailbox");
+    if (!endpoint) throw std::invalid_argument("WorkerThread::start: null endpoint");
     ring_ = ring;
     manager_ = manager;
     on_complete_ = on_complete;
-    mailbox_ = mailbox;
+    endpoint_ = std::move(endpoint);
     shutdown_ = false;
     idle_.store(true, std::memory_order_relaxed);
     thread_ = std::thread(&WorkerThread::loop, this);
@@ -106,10 +190,15 @@ void WorkerThread::stop() {
 }
 
 void WorkerThread::shutdown_child() {
-    if (mailbox_) {
-        write_mailbox_state(MailboxState::SHUTDOWN);
-    }
+    if (endpoint_) endpoint_->shutdown_child();
 }
+
+const WorkerEndpointCaps &WorkerThread::caps() const {
+    if (!endpoint_) throw std::runtime_error("WorkerThread::caps: null endpoint");
+    return endpoint_->caps();
+}
+
+int32_t WorkerThread::endpoint_id() const { return caps().endpoint_id; }
 
 // =============================================================================
 // WorkerThread — main loop + per-mode dispatch
@@ -128,29 +217,51 @@ void WorkerThread::loop() {
             queue_.pop();
         }
 
-        TaskSlotState &s = *ring_->slot_state(d.task_slot);
-
-        // dispatch_process may throw on a non-zero ERROR from the child.
-        // An uncaught exception escaping loop() would terminate the
-        // std::thread via std::terminate — instead, capture it and let
-        // the orch thread observe it at the next submit_*/drain.
-        // on_complete_ still fires so the scheduler releases consumers
-        // and active_tasks_ eventually reaches zero; otherwise drain()
-        // would hang.
+        WorkerCompletion completion;
         try {
-            dispatch_process(s, d.group_index);
+            completion = dispatch_process(d);
+        } catch (const std::exception &e) {
+            completion.task_slot = d.task_slot;
+            completion.group_index = d.group_index;
+            completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+            completion.error_message = std::string("WorkerThread endpoint failed: ") + e.what();
         } catch (...) {
-            if (manager_) manager_->report_error(std::current_exception());
+            completion.task_slot = d.task_slot;
+            completion.group_index = d.group_index;
+            completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+            completion.error_message = "WorkerThread endpoint failed with unknown exception";
+        }
+
+        if (completion.outcome != EndpointOutcome::SUCCESS && manager_) {
+            manager_->report_error(std::make_exception_ptr(std::runtime_error(completion.error_message)));
         }
 
         idle_.store(true, std::memory_order_release);
-        on_complete_(d.task_slot);
+        on_complete_(std::move(completion));
     }
 }
 
-void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
-    uint64_t callable = static_cast<uint64_t>(static_cast<uint32_t>(s.callable_id));
+WorkerCompletion WorkerThread::dispatch_process(WorkerDispatch d) {
+    if (!endpoint_) throw std::runtime_error("WorkerThread::dispatch_process: null endpoint");
+    return endpoint_->run(ring_, d);
+}
+
+WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dispatch) {
+    if (ring == nullptr) throw std::invalid_argument("LocalMailboxEndpoint::run: null ring");
+    TaskSlotState &s = *ring->slot_state(dispatch.task_slot);
+    int32_t group_index = dispatch.group_index;
     TaskArgsView view = s.args_view(group_index);
+    if (!s.remote_sidecar_for(group_index).empty()) {
+        WorkerCompletion completion;
+        completion.task_slot = dispatch.task_slot;
+        completion.group_index = group_index;
+        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+        completion.error_message = "LocalMailboxEndpoint::run: remote task sidecar is not supported by local mailbox";
+        return completion;
+    }
+    WorkerCompletion completion;
+    completion.task_slot = dispatch.task_slot;
+    completion.group_index = group_index;
 
     // Hold mailbox_mu_ for the entire round trip (write payload + state +
     // spin-poll TASK_DONE + reset to IDLE). Any control_* request from the
@@ -158,7 +269,9 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     // mailbox; without this they would race on MAILBOX_OFF_STATE.
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     if (mailbox_control_timed_out_) {
-        throw std::runtime_error("WorkerThread::dispatch_process: mailbox has an unresolved timed-out control command");
+        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+        completion.error_message = "LocalMailboxEndpoint::run: mailbox has an unresolved timed-out control command";
+        return completion;
     }
 
     // Clear the child-writable error fields so stale bytes from a prior
@@ -167,31 +280,38 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
     std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
 
-    // Write callable.
-    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &callable, sizeof(uint64_t));
+    uint64_t reserved_callable = 0;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(uint64_t));
 
     // Write config as a single packed POD block (see call_config.h).
     std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
 
     // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
-    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor) +
+    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor) +
                         static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
     if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
-        throw std::runtime_error("WorkerThread::dispatch_process: args blob exceeds mailbox capacity");
+        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+        completion.error_message =
+            "LocalMailboxEndpoint::run: args blob exceeds mailbox capacity: need " + std::to_string(blob_bytes) +
+            " bytes, capacity " + std::to_string(MAILBOX_ARGS_CAPACITY) +
+            " bytes, tensors=" + std::to_string(view.tensor_count) + ", scalars=" + std::to_string(view.scalar_count);
+        return completion;
     }
-    uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_ARGS);
+    uint8_t *hash_dst = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_CALLABLE_HASH);
+    std::memcpy(hash_dst, s.callable.digest.data(), CALLABLE_HASH_DIGEST_SIZE);
+
+    uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_ARGS_BLOB);
     std::memcpy(d + 0, &view.tensor_count, sizeof(int32_t));
     std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
     if (view.tensor_count > 0) {
         std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensors,
-            static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor)
+            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensor_bytes, static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
         );
     }
     if (view.scalar_count > 0) {
         std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor),
-            view.scalars, static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
+            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor), view.scalars,
+            static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
         );
     }
 
@@ -212,12 +332,16 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     if (error_code != 0) {
         std::string msg = read_error_msg(mbox());
         write_mailbox_state(MailboxState::IDLE);
-        throw std::runtime_error(
-            "WorkerThread::dispatch_process: child failed (code=" + std::to_string(error_code) + "): " + msg
-        );
+        completion.outcome = EndpointOutcome::TASK_FAILURE;
+        completion.error_message =
+            "LocalMailboxEndpoint::run: child failed (endpoint=" + std::to_string(caps_.endpoint_id) +
+            ", code=" + std::to_string(error_code) + "): " + msg;
+        return completion;
     }
 
     write_mailbox_state(MailboxState::IDLE);
+    completion.outcome = EndpointOutcome::SUCCESS;
+    return completion;
 }
 
 // =============================================================================
@@ -226,19 +350,55 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
 
 void WorkerManager::add_next_level(void *mailbox) { next_level_entries_.push_back(mailbox); }
 
+void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint) {
+    if (!endpoint) throw std::invalid_argument("WorkerManager::add_next_level_endpoint: null endpoint");
+    next_level_endpoint_entries_.push_back(std::move(endpoint));
+}
+
 void WorkerManager::add_sub(void *mailbox) { sub_entries_.push_back(mailbox); }
 
 void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
-    auto make_threads = [&](const std::vector<void *> &entries, std::vector<std::unique_ptr<WorkerThread>> &threads) {
-        for (void *mailbox : entries) {
+
+    std::vector<int32_t> next_level_endpoint_ids;
+    next_level_endpoint_ids.reserve(next_level_entries_.size() + next_level_endpoint_entries_.size());
+    auto register_next_level_endpoint_id = [&](int32_t endpoint_id) {
+        if (endpoint_id < 0) {
+            throw std::runtime_error("WorkerManager::start: endpoint must have a stable endpoint_id");
+        }
+        if (std::find(next_level_endpoint_ids.begin(), next_level_endpoint_ids.end(), endpoint_id) !=
+            next_level_endpoint_ids.end()) {
+            throw std::runtime_error(
+                "WorkerManager::start: duplicate NEXT_LEVEL endpoint_id " + std::to_string(endpoint_id)
+            );
+        }
+        next_level_endpoint_ids.push_back(endpoint_id);
+    };
+    for (size_t i = 0; i < next_level_entries_.size(); ++i) {
+        register_next_level_endpoint_id(static_cast<int32_t>(i));
+    }
+    for (const auto &endpoint : next_level_endpoint_entries_) {
+        register_next_level_endpoint_id(endpoint->caps().endpoint_id);
+    }
+
+    auto make_threads = [&](const std::vector<void *> &entries, std::vector<std::unique_ptr<WorkerThread>> &threads,
+                            int32_t endpoint_offset) {
+        for (size_t i = 0; i < entries.size(); ++i) {
             auto wt = std::make_unique<WorkerThread>();
-            wt->start(ring, this, on_complete, mailbox);
+            auto endpoint =
+                std::make_unique<LocalMailboxEndpoint>(endpoint_offset + static_cast<int32_t>(i), entries[i]);
+            wt->start(ring, this, on_complete, std::move(endpoint));
             threads.push_back(std::move(wt));
         }
     };
-    make_threads(next_level_entries_, next_level_threads_);
-    make_threads(sub_entries_, sub_threads_);
+    make_threads(next_level_entries_, next_level_threads_, 0);
+    for (auto &endpoint : next_level_endpoint_entries_) {
+        auto wt = std::make_unique<WorkerThread>();
+        wt->start(ring, this, on_complete, std::move(endpoint));
+        next_level_threads_.push_back(std::move(wt));
+    }
+    next_level_endpoint_entries_.clear();
+    make_threads(sub_entries_, sub_threads_, 0);
 }
 
 void WorkerManager::report_error(std::exception_ptr e) {
@@ -303,10 +463,36 @@ WorkerThread *WorkerManager::get_worker(WorkerType type, int logical_id) const {
     return threads[static_cast<size_t>(logical_id)].get();
 }
 
+WorkerThread *WorkerManager::get_worker_by_endpoint_id(WorkerType type, int32_t endpoint_id) const {
+    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
+    for (auto &wt : threads) {
+        if (wt->endpoint_id() == endpoint_id) return wt.get();
+    }
+    return nullptr;
+}
+
 WorkerThread *WorkerManager::pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const {
+    static const std::vector<int32_t> unconstrained;
+    return pick_idle_excluding_eligible(type, exclude, unconstrained);
+}
+
+WorkerThread *WorkerManager::pick_idle_excluding_eligible(
+    WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_endpoint_ids
+) const {
     auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     for (auto &wt : threads) {
         if (!wt->idle()) continue;
+        if (!eligible_endpoint_ids.empty()) {
+            bool eligible = false;
+            int32_t endpoint_id = wt->endpoint_id();
+            for (int32_t id : eligible_endpoint_ids) {
+                if (id == endpoint_id) {
+                    eligible = true;
+                    break;
+                }
+            }
+            if (!eligible) continue;
+        }
         bool excluded = false;
         for (auto *ex : exclude) {
             if (ex == wt.get()) {
@@ -320,7 +506,7 @@ WorkerThread *WorkerManager::pick_idle_excluding(WorkerType type, const std::vec
 }
 
 // =============================================================================
-// WorkerThread — memory control (orch thread, concurrent with worker thread)
+// LocalMailboxEndpoint — memory control (orch thread, concurrent with worker thread)
 // =============================================================================
 
 static void write_control_args(char *mbox, uint64_t sub_cmd, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0) {
@@ -336,12 +522,20 @@ static uint64_t read_control_result(const char *mbox) {
     return r;
 }
 
+static void write_control_digest(char *mbox, const uint8_t *digest) {
+    if (digest == nullptr) {
+        std::memset(mbox + MAILBOX_OFF_CONTROL_CALLABLE_HASH, 0, CALLABLE_HASH_DIGEST_SIZE);
+        return;
+    }
+    std::memcpy(mbox + MAILBOX_OFF_CONTROL_CALLABLE_HASH, digest, CALLABLE_HASH_DIGEST_SIZE);
+}
+
 // Issue a control sub-command and block until the child publishes
 // CONTROL_DONE. Caller must hold `mailbox_mu_`. On a non-zero error code
 // from the child, throws and leaves the mailbox in IDLE before unwinding
 // (so the next claim starts from a clean state). The `op_name` is used
 // only for the exception message.
-void WorkerThread::run_control_command(const char *op_name, double timeout_s) {
+void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeout_s) {
     if (mailbox_control_timed_out_) {
         throw std::runtime_error(std::string(op_name) + " failed: mailbox has an unresolved timed-out control command");
     }
@@ -371,27 +565,29 @@ void WorkerThread::run_control_command(const char *op_name, double timeout_s) {
     write_mailbox_state(MailboxState::IDLE);
 }
 
-uint64_t WorkerThread::control_malloc(size_t size) {
+uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
     run_control_command("control_malloc");
     return read_control_result(mbox());
 }
 
-void WorkerThread::control_prepare(int32_t cid) {
+void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_args(mbox(), CTRL_PREPARE, static_cast<uint64_t>(static_cast<uint32_t>(cid)));
+    write_control_args(mbox(), CTRL_PREPARE);
+    write_control_digest(mbox(), digest);
     run_control_command("control_prepare");
 }
 
-void WorkerThread::control_register(int32_t cid, const char *shm_name) {
+void LocalMailboxEndpoint::control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     // OFF_ERROR / OFF_ERROR_MSG are cleared by run_control_command — no
     // prelude memset needed (matches the other control_* methods).
     uint64_t sub_cmd = CTRL_REGISTER;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
-    uint64_t cid_v = static_cast<uint32_t>(cid);
-    std::memcpy(mbox() + CTRL_OFF_ARG0, &cid_v, sizeof(uint64_t));
+    uint64_t payload_size = static_cast<uint64_t>(blob_size);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &payload_size, sizeof(uint64_t));
+    write_control_digest(mbox(), digest);
     // Stage the NUL-terminated shm name in the args region. Pad with zeros so
     // stale bytes from a prior control op cannot leak into the child's decode.
     size_t name_len = std::strlen(shm_name);
@@ -403,17 +599,73 @@ void WorkerThread::control_register(int32_t cid, const char *shm_name) {
     run_control_command("control_register");
 }
 
-void WorkerThread::control_unregister(int32_t cid) {
+void LocalMailboxEndpoint::control_unregister(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_args(mbox(), CTRL_UNREGISTER, static_cast<uint64_t>(static_cast<uint32_t>(cid)));
+    write_control_args(mbox(), CTRL_UNREGISTER);
+    write_control_digest(mbox(), digest);
     run_control_command("control_unregister");
 }
 
-void WorkerThread::control_generic(uint64_t sub_cmd, int32_t cid, const char *shm_name, double timeout_s) {
+void LocalMailboxEndpoint::control_remote_prepare_register(
+    remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *, const void *, size_t
+) {
+    throw_unsupported_control("control_remote_prepare_register");
+}
+
+void LocalMailboxEndpoint::control_remote_commit_register(
+    remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *
+) {
+    throw_unsupported_control("control_remote_commit_register");
+}
+
+void LocalMailboxEndpoint::control_remote_abort_register(
+    remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *
+) {
+    throw_unsupported_control("control_remote_abort_register");
+}
+
+void LocalMailboxEndpoint::control_remote_unregister(remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *) {
+    throw_unsupported_control("control_remote_unregister");
+}
+
+RemoteBufferHandle LocalMailboxEndpoint::control_remote_malloc(size_t) {
+    throw_unsupported_control("control_remote_malloc");
+}
+
+void LocalMailboxEndpoint::control_remote_free(const RemoteBufferHandle &) {
+    throw_unsupported_control("control_remote_free");
+}
+
+void LocalMailboxEndpoint::control_remote_copy_to(const RemoteBufferHandle &, uint64_t, const void *, size_t) {
+    throw_unsupported_control("control_remote_copy_to");
+}
+
+void LocalMailboxEndpoint::control_remote_copy_from(void *, const RemoteBufferHandle &, uint64_t, size_t) {
+    throw_unsupported_control("control_remote_copy_from");
+}
+
+RemoteBufferExport LocalMailboxEndpoint::control_remote_export(
+    const RemoteBufferHandle &, uint64_t, uint64_t, uint32_t, const std::string &
+) {
+    throw_unsupported_control("control_remote_export");
+}
+
+RemoteBufferHandle LocalMailboxEndpoint::control_remote_import(int32_t, const RemoteBufferExport &, uint32_t) {
+    throw_unsupported_control("control_remote_import");
+}
+
+void LocalMailboxEndpoint::control_remote_release_import(const RemoteBufferHandle &) {
+    throw_unsupported_control("control_remote_release_import");
+}
+
+void LocalMailboxEndpoint::control_generic(
+    uint64_t sub_cmd, const char *shm_name, size_t staged_payload_size, double timeout_s, const uint8_t *digest
+) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
-    uint64_t cid_v = static_cast<uint32_t>(cid);
-    std::memcpy(mbox() + CTRL_OFF_ARG0, &cid_v, sizeof(uint64_t));
+    uint64_t payload_size = static_cast<uint64_t>(staged_payload_size);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &payload_size, sizeof(uint64_t));
+    write_control_digest(mbox(), digest);
     const char *name = shm_name ? shm_name : "";
     size_t name_len = std::strlen(name);
     if (name_len + 1 > CTRL_SHM_NAME_BYTES) {
@@ -424,19 +676,19 @@ void WorkerThread::control_generic(uint64_t sub_cmd, int32_t cid, const char *sh
     run_control_command("control_generic", timeout_s);
 }
 
-void WorkerThread::control_free(uint64_t ptr) {
+void LocalMailboxEndpoint::control_free(uint64_t ptr) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_FREE, ptr);
     run_control_command("control_free");
 }
 
-void WorkerThread::control_copy_to(uint64_t dst, uint64_t src, size_t size) {
+void LocalMailboxEndpoint::control_copy_to(uint64_t dst, uint64_t src, size_t size) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_COPY_TO, dst, src, static_cast<uint64_t>(size));
     run_control_command("control_copy_to");
 }
 
-void WorkerThread::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
+void LocalMailboxEndpoint::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_COPY_FROM, dst, src, static_cast<uint64_t>(size));
     run_control_command("control_copy_from");
@@ -459,7 +711,7 @@ static void write_shm_name_pair(char *mbox, const char *request_shm_name, const 
     write_one(mbox + MAILBOX_OFF_ARGS + CTRL_SHM_NAME_BYTES, reply_shm_name);
 }
 
-void WorkerThread::control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) {
+void LocalMailboxEndpoint::control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) {
     if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
         throw std::runtime_error("control_alloc_domain: request and reply shm names must be non-empty");
     }
@@ -470,7 +722,7 @@ void WorkerThread::control_alloc_domain(const char *request_shm_name, const char
     run_control_command("control_alloc_domain");
 }
 
-void WorkerThread::control_release_domain(const char *request_shm_name) {
+void LocalMailboxEndpoint::control_release_domain(const char *request_shm_name) {
     if (!request_shm_name || !*request_shm_name) {
         throw std::runtime_error("control_release_domain: request shm name must be non-empty");
     }
@@ -481,7 +733,7 @@ void WorkerThread::control_release_domain(const char *request_shm_name) {
     run_control_command("control_release_domain");
 }
 
-void WorkerThread::control_comm_init(const char *request_shm_name) {
+void LocalMailboxEndpoint::control_comm_init(const char *request_shm_name) {
     if (!request_shm_name || !*request_shm_name) {
         throw std::runtime_error("control_comm_init: request shm name must be non-empty");
     }
@@ -490,6 +742,134 @@ void WorkerThread::control_comm_init(const char *request_shm_name) {
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, "");
     run_control_command("control_comm_init");
+}
+
+uint64_t WorkerThread::control_malloc(size_t size) {
+    if (!endpoint_) throw std::runtime_error("control_malloc: null endpoint");
+    return endpoint_->control_malloc(size);
+}
+
+void WorkerThread::control_prepare(const uint8_t *digest) {
+    if (!endpoint_) throw std::runtime_error("control_prepare: null endpoint");
+    endpoint_->control_prepare(digest);
+}
+
+void WorkerThread::control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) {
+    if (!endpoint_) throw std::runtime_error("control_register: null endpoint");
+    endpoint_->control_register(shm_name, blob_size, digest);
+}
+
+void WorkerThread::control_unregister(const uint8_t *digest) {
+    if (!endpoint_) throw std::runtime_error("control_unregister: null endpoint");
+    endpoint_->control_unregister(digest);
+}
+
+void WorkerThread::control_remote_prepare_register(
+    remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest,
+    const void *payload, size_t payload_size
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_prepare_register: null endpoint");
+    endpoint_->control_remote_prepare_register(target_registry, callable_kind, digest, payload, payload_size);
+}
+
+void WorkerThread::control_remote_commit_register(
+    remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_commit_register: null endpoint");
+    endpoint_->control_remote_commit_register(target_registry, callable_kind, digest);
+}
+
+void WorkerThread::control_remote_abort_register(
+    remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_abort_register: null endpoint");
+    endpoint_->control_remote_abort_register(target_registry, callable_kind, digest);
+}
+
+void WorkerThread::control_remote_unregister(
+    remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_unregister: null endpoint");
+    endpoint_->control_remote_unregister(target_registry, callable_kind, digest);
+}
+
+RemoteBufferHandle WorkerThread::control_remote_malloc(size_t size) {
+    if (!endpoint_) throw std::runtime_error("control_remote_malloc: null endpoint");
+    return endpoint_->control_remote_malloc(size);
+}
+
+void WorkerThread::control_remote_free(const RemoteBufferHandle &handle) {
+    if (!endpoint_) throw std::runtime_error("control_remote_free: null endpoint");
+    endpoint_->control_remote_free(handle);
+}
+
+void WorkerThread::control_remote_copy_to(
+    const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_copy_to: null endpoint");
+    endpoint_->control_remote_copy_to(handle, offset, src, size);
+}
+
+void WorkerThread::control_remote_copy_from(void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size) {
+    if (!endpoint_) throw std::runtime_error("control_remote_copy_from: null endpoint");
+    endpoint_->control_remote_copy_from(dst, handle, offset, size);
+}
+
+RemoteBufferExport WorkerThread::control_remote_export(
+    const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
+    const std::string &transport_profile
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_export: null endpoint");
+    return endpoint_->control_remote_export(handle, offset, size, access_flags, transport_profile);
+}
+
+RemoteBufferHandle WorkerThread::control_remote_import(
+    int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_import: null endpoint");
+    return endpoint_->control_remote_import(importer_endpoint_id, export_desc, requested_access_flags);
+}
+
+void WorkerThread::control_remote_release_import(const RemoteBufferHandle &handle) {
+    if (!endpoint_) throw std::runtime_error("control_remote_release_import: null endpoint");
+    endpoint_->control_remote_release_import(handle);
+}
+
+void WorkerThread::control_generic(
+    uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+) {
+    if (!endpoint_) throw std::runtime_error("control_generic: null endpoint");
+    endpoint_->control_generic(sub_cmd, shm_name, payload_size, timeout_s, digest);
+}
+
+void WorkerThread::control_free(uint64_t ptr) {
+    if (!endpoint_) throw std::runtime_error("control_free: null endpoint");
+    endpoint_->control_free(ptr);
+}
+
+void WorkerThread::control_copy_to(uint64_t dst, uint64_t src, size_t size) {
+    if (!endpoint_) throw std::runtime_error("control_copy_to: null endpoint");
+    endpoint_->control_copy_to(dst, src, size);
+}
+
+void WorkerThread::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
+    if (!endpoint_) throw std::runtime_error("control_copy_from: null endpoint");
+    endpoint_->control_copy_from(dst, src, size);
+}
+
+void WorkerThread::control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_alloc_domain: null endpoint");
+    endpoint_->control_alloc_domain(request_shm_name, reply_shm_name);
+}
+
+void WorkerThread::control_release_domain(const char *request_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_release_domain: null endpoint");
+    endpoint_->control_release_domain(request_shm_name);
+}
+
+void WorkerThread::control_comm_init(const char *request_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_comm_init: null endpoint");
+    endpoint_->control_comm_init(request_shm_name);
 }
 
 bool WorkerManager::any_busy() const {
@@ -506,21 +886,19 @@ bool WorkerManager::any_busy() const {
 
 namespace {
 
-// Process-wide monotonic counter so concurrent broadcasts to the same cid
-// don't collide on shm name. Atomic increment is enough — no need to lock.
+// Process-wide monotonic counter so concurrent broadcasts do not collide on shm
+// name. Atomic increment is enough — no need to lock.
 std::atomic<uint64_t> g_shm_counter{0};
 
 // Build the per-broadcast POSIX shm name. The name itself does NOT carry the
 // leading '/' that shm_open requires (Python's multiprocessing.SharedMemory
 // uses the same convention, so the child Python side reads the field as a
 // plain name). Caller adds '/' when opening.
-std::string make_shm_name(int32_t cid) {
+std::string make_shm_name() {
     char buf[CTRL_SHM_NAME_BYTES];
     int pid = static_cast<int>(getpid());
     uint64_t counter = g_shm_counter.fetch_add(1, std::memory_order_relaxed);
-    int n = std::snprintf(
-        buf, sizeof(buf), "simpler-cb-%d-%d-%llu", pid, static_cast<int>(cid), static_cast<unsigned long long>(counter)
-    );
+    int n = std::snprintf(buf, sizeof(buf), "simpler-cb-%d-%llu", pid, static_cast<unsigned long long>(counter));
     if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) {
         throw std::runtime_error("broadcast_register: shm name overflow");
     }
@@ -529,9 +907,8 @@ std::string make_shm_name(int32_t cid) {
 
 // Strip the outer "<op_name> failed on child: " prefix that
 // run_control_command prepends to every control failure, so the broadcast
-// caller can surface the child-side message (`register cid=<N>
-// chip=<id>: <reason>` per docs §6) directly under its own one-line
-// Worker.{register,unregister}(cid=N) prefix.
+// caller can surface the child-side message (`register hash=sha256:...
+// chip=<id>: <reason>`) directly under its own one-line Worker.register prefix.
 std::string strip_control_prefix(const std::string &msg, const std::string &op_name) {
     const std::string needle = op_name + " failed on child: ";
     if (msg.compare(0, needle.size(), needle) == 0) {
@@ -592,12 +969,12 @@ private:
 
 }  // namespace
 
-void WorkerManager::control_prepare(int worker_id, int32_t cid) {
+void WorkerManager::control_prepare(int worker_id, const uint8_t *digest) {
     auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_prepare: invalid worker_id " + std::to_string(worker_id));
     }
-    wt->control_prepare(cid);
+    wt->control_prepare(digest);
 }
 
 void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
@@ -624,25 +1001,192 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
     wt->control_comm_init(request_shm_name);
 }
 
-void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size) {
-    if (next_level_threads_.empty()) return;
+ControlResult WorkerManager::control_digest_only(
+    WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s
+) {
+    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
+    const char *type_name = (type == WorkerType::NEXT_LEVEL) ? "NEXT_LEVEL" : "SUB";
+    ControlResult result{type_name, static_cast<int32_t>(worker_id), false, ""};
+    if (worker_id < 0 || static_cast<size_t>(worker_id) >= threads.size()) {
+        result.error_message = "invalid worker_id " + std::to_string(worker_id);
+        return result;
+    }
+    try {
+        threads[static_cast<size_t>(worker_id)]->control_generic(sub_cmd, nullptr, 0, timeout_s, digest);
+        result.ok = true;
+    } catch (const std::exception &e) {
+        result.error_message = strip_control_prefix(e.what(), "control_generic");
+    }
+    return result;
+}
 
-    std::string shm_name = make_shm_name(cid);
+ControlResult WorkerManager::control_remote_prepare_register(
+    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
+    size_t payload_size, const uint8_t *digest
+) {
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    if (wt == nullptr) {
+        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        return result;
+    }
+    try {
+        wt->control_remote_prepare_register(target_registry, callable_kind, digest, payload, payload_size);
+        result.ok = true;
+    } catch (const std::exception &e) {
+        result.error_message = strip_control_prefix(e.what(), "control_remote_prepare_register");
+    }
+    return result;
+}
+
+ControlResult WorkerManager::control_remote_commit_register(
+    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+) {
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    if (wt == nullptr) {
+        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        return result;
+    }
+    try {
+        wt->control_remote_commit_register(target_registry, callable_kind, digest);
+        result.ok = true;
+    } catch (const std::exception &e) {
+        result.error_message = strip_control_prefix(e.what(), "control_remote_commit_register");
+    }
+    return result;
+}
+
+ControlResult WorkerManager::control_remote_abort_register(
+    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+) {
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    if (wt == nullptr) {
+        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        return result;
+    }
+    try {
+        wt->control_remote_abort_register(target_registry, callable_kind, digest);
+        result.ok = true;
+    } catch (const std::exception &e) {
+        result.error_message = strip_control_prefix(e.what(), "control_remote_abort_register");
+    }
+    return result;
+}
+
+ControlResult WorkerManager::control_remote_unregister(
+    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+) {
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    if (wt == nullptr) {
+        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        return result;
+    }
+    try {
+        wt->control_remote_unregister(target_registry, callable_kind, digest);
+        result.ok = true;
+    } catch (const std::exception &e) {
+        result.error_message = strip_control_prefix(e.what(), "control_remote_unregister");
+    }
+    return result;
+}
+
+RemoteBufferHandle WorkerManager::control_remote_malloc(int endpoint_id, size_t size) {
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_remote_malloc: invalid endpoint_id " + std::to_string(endpoint_id));
+    }
+    return wt->control_remote_malloc(size);
+}
+
+void WorkerManager::control_remote_free(const RemoteBufferHandle &handle) {
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_remote_free: invalid endpoint_id " + std::to_string(handle.endpoint_id));
+    }
+    wt->control_remote_free(handle);
+}
+
+void WorkerManager::control_remote_copy_to(
+    const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size
+) {
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_remote_copy_to: invalid endpoint_id " + std::to_string(handle.endpoint_id));
+    }
+    wt->control_remote_copy_to(handle, offset, src, size);
+}
+
+void WorkerManager::control_remote_copy_from(
+    void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size
+) {
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_remote_copy_from: invalid endpoint_id " + std::to_string(handle.endpoint_id));
+    }
+    wt->control_remote_copy_from(dst, handle, offset, size);
+}
+
+RemoteBufferExport WorkerManager::control_remote_export(
+    const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
+    const std::string &transport_profile
+) {
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.owner_endpoint_id);
+    if (wt == nullptr) {
+        throw std::runtime_error(
+            "control_remote_export: invalid owner endpoint_id " + std::to_string(handle.owner_endpoint_id)
+        );
+    }
+    return wt->control_remote_export(handle, offset, size, access_flags, transport_profile);
+}
+
+RemoteBufferHandle WorkerManager::control_remote_import(
+    int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+) {
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, importer_endpoint_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_remote_import: invalid endpoint_id " + std::to_string(importer_endpoint_id));
+    }
+    return wt->control_remote_import(importer_endpoint_id, export_desc, requested_access_flags);
+}
+
+void WorkerManager::control_remote_release_import(const RemoteBufferHandle &handle) {
+    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    if (wt == nullptr) {
+        throw std::runtime_error(
+            "control_remote_release_import: invalid endpoint_id " + std::to_string(handle.endpoint_id)
+        );
+    }
+    wt->control_remote_release_import(handle);
+}
+
+std::vector<ControlResult>
+WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, const uint8_t *digest) {
+    std::vector<ControlResult> results;
+    results.reserve(next_level_threads_.size());
+    for (size_t i = 0; i < next_level_threads_.size(); ++i) {
+        results.push_back(ControlResult{"NEXT_LEVEL", static_cast<int32_t>(i), true, ""});
+    }
+    if (next_level_threads_.empty()) return results;
+
+    std::string shm_name = make_shm_name();
     PosixShmHolder shm(shm_name, blob_size);
     std::memcpy(shm.addr(), blob_ptr, blob_size);
 
     // Fan out to every WorkerThread in parallel. Per-WorkerThread mailbox_mu_
     // is independent, so N control_register calls run concurrently — latency
     // is 1 × prepare_cost instead of N × prepare_cost.
-    std::vector<std::exception_ptr> errors(next_level_threads_.size(), nullptr);
     std::vector<std::thread> workers;
     workers.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
-        workers.emplace_back([this, i, cid, name = shm.name(), &errors]() {
+        workers.emplace_back([this, i, digest, blob_size, name = shm.name(), &results]() {
             try {
-                next_level_threads_[i]->control_register(cid, name.c_str());
-            } catch (...) {
-                errors[i] = std::current_exception();
+                next_level_threads_[i]->control_register(name.c_str(), blob_size, digest);
+            } catch (const std::exception &e) {
+                results[i].ok = false;
+                results[i].error_message = strip_control_prefix(e.what(), "control_register");
             }
         });
     }
@@ -653,22 +1197,17 @@ void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, si
     // name during control_register and have already closed their mappings
     // before publishing CONTROL_DONE — see python/simpler/worker.py.
 
-    for (size_t i = 0; i < errors.size(); ++i) {
-        if (errors[i]) {
-            try {
-                std::rethrow_exception(errors[i]);
-            } catch (const std::exception &e) {
-                std::string msg = strip_control_prefix(e.what(), "control_register");
-                throw std::runtime_error(
-                    std::string("Worker.register(cid=") + std::to_string(cid) + ") failed on next_level " +
-                    std::to_string(i) + ": " + msg
-                );
-            }
+    std::string hash = format_digest(digest);
+    for (auto &result : results) {
+        if (!result.ok && result.error_message.find("hash=") == std::string::npos) {
+            result.error_message = "Worker.register(hash=" + hash + ") failed on next_level " +
+                                   std::to_string(result.worker_index) + ": " + result.error_message;
         }
     }
+    return results;
 }
 
-std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
+std::vector<std::string> WorkerManager::broadcast_unregister_all(const uint8_t *digest) {
     std::vector<std::string> errors;
     if (next_level_threads_.empty()) return errors;
 
@@ -676,9 +1215,9 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
     std::vector<std::thread> workers;
     workers.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
-        workers.emplace_back([this, i, cid, &per_worker]() {
+        workers.emplace_back([this, i, digest, &per_worker]() {
             try {
-                next_level_threads_[i]->control_unregister(cid);
+                next_level_threads_[i]->control_unregister(digest);
             } catch (const std::exception &e) {
                 std::string msg = strip_control_prefix(e.what(), "control_unregister");
                 per_worker[i] = std::string("next_level ") + std::to_string(i) + ": " + msg;
@@ -695,7 +1234,7 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
 }
 
 std::vector<ControlResult> WorkerManager::broadcast_control_all(
-    WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+    WorkerType type, uint64_t sub_cmd, const void *payload, size_t payload_size, const uint8_t *digest, double timeout_s
 ) {
     auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     const char *type_name = (type == WorkerType::NEXT_LEVEL) ? "NEXT_LEVEL" : "SUB";
@@ -713,7 +1252,7 @@ std::vector<ControlResult> WorkerManager::broadcast_control_all(
         if (payload == nullptr || payload_size == 0) {
             throw std::runtime_error("broadcast_control_all: payload pointer and size must both be set");
         }
-        shm_name = make_shm_name(cid);
+        shm_name = make_shm_name();
         shm = std::make_unique<PosixShmHolder>(shm_name, payload_size);
         std::memcpy(shm->addr(), payload, payload_size);
     }
@@ -723,7 +1262,9 @@ std::vector<ControlResult> WorkerManager::broadcast_control_all(
     for (size_t i = 0; i < threads.size(); ++i) {
         workers.emplace_back([&, i]() {
             try {
-                threads[i]->control_generic(sub_cmd, cid, shm_name.empty() ? nullptr : shm_name.c_str(), timeout_s);
+                threads[i]->control_generic(
+                    sub_cmd, shm_name.empty() ? nullptr : shm_name.c_str(), payload_size, timeout_s, digest
+                );
             } catch (const std::exception &e) {
                 results[i].ok = false;
                 results[i].error_message = strip_control_prefix(e.what(), "control_generic");

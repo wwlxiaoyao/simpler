@@ -12,6 +12,11 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 
 - ``swimlane_converter``   : perf JSON -> Perfetto/Chrome trace
 - ``sched_overhead_analysis``: scheduler overhead deep-dive
-- ``deps_to_graph``         : deps.json -> pan/zoom HTML dependency graph
+- ``deps_viewer``           : deps.json -> text or pan/zoom HTML dependency graph
 - ``dump_viewer``           : inspect tensor dumps
+- ``device_log_timing``     : Total/Orch/Sched from a CANN device log
+
+Shared helper modules (imported by the CLIs above, not run directly):
+
+- ``device_log_resolver``   : resolve a CANN device log path
 """
