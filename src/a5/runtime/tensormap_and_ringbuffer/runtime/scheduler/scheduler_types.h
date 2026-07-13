@@ -24,7 +24,7 @@
 // Profiling macros (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/device_time.h"
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
@@ -64,13 +64,11 @@ constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator erro
 // kills the slower-but-correct poller mid-poll — see the distributed
 // startup-skew scenario in issue #897.
 //
-// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h)
-// because the safe value differs per variant: onboard trims it to 2 s so the
-// AICPU detects a hang and flushes its diagnostics (tensor dump, in-flight
-// partial output) before STARS reaps the op and poisons the context (chain:
-// this < op-exec < host stream-sync, platform_config.h); sim has no STARS to
-// race and keeps the full 5 s #897 headroom. See spin_hint.h for the per-variant
-// rationale.
+// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h).
+// Onboard keeps it below the STARS op-execute and host stream-sync budgets so
+// the AICPU can flush diagnostics before the host-visible timeout chain fires.
+// Sim has no STARS or ACL stream-sync timeout, but uses the same no-progress
+// watchdog shape. See spin_hint.h for the per-variant rationale.
 constexpr int32_t SCHEDULER_TIMEOUT_MS = PLATFORM_SCHEDULER_TIMEOUT_MS;
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
@@ -110,13 +108,13 @@ struct alignas(64) CoreExecState {
     // hot completion poll does a single volatile load instead of recomputing
     // reg_base + reg_offset(COND) on every iteration.
     volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // --- Profiling fields (dispatch path, compile-time gated) ---
     uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
-    int32_t worker_id;          // offset 48: index in runtime.workers[]
+    int32_t worker_id;          // offset 48: index in runtime.dev.workers[]
     uint32_t physical_core_id;  // offset 52: hardware physical core ID
     CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
     uint8_t pad2_[4];           // offset 60: pad to 64 bytes
@@ -308,9 +306,14 @@ public:
     // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
     enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
 
-    // A MIX block must place all cores named by active_mask the same way:
-    // all idle means running placement, all running means pending placement,
-    // and any mixed state is retried later.
+    // Placement for the cores named by active_mask, ignoring cores this task does
+    // not use. All used cores idle -> RUNNING placement (each to its running slot).
+    // Otherwise -> PENDING placement: at dispatch each used core is filled per its
+    // own state -- an idle core takes its running slot (and is marked running, so
+    // the completion poller, which scans only running cores, tracks its FIN), an
+    // already-running core takes its pending slot and executes after its in-flight
+    // task. REJECT only when a used core's pending slot is already occupied (no free
+    // slot) or the mask is empty.
     MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
         BitStates used(0ULL);
         if (core_mask & PTO2_SUBTASK_MASK_AIC) {
@@ -330,10 +333,7 @@ public:
         if (idle.count() == used.count()) {
             return MixPlacement::RUNNING;
         }
-        if (!idle.has_value()) {
-            return MixPlacement::PENDING;
-        }
-        return MixPlacement::REJECT;
+        return MixPlacement::PENDING;
     }
 
     BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
@@ -416,14 +416,13 @@ struct SlotTransition {
 // Profiling counters (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 struct alignas(64) SchedL2SwimlaneCounters {
     bool l2_swimlane_enabled{false};
     uint64_t sched_start_ts{0};
     uint64_t sched_scan_cycle{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
     uint64_t sched_idle_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
@@ -434,8 +433,7 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
-#if PTO2_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
+#if SIMPLER_SCHED_PROFILING
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
     uint64_t sched_complete_perf_cycle{0};

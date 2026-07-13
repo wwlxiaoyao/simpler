@@ -142,7 +142,7 @@ extern "C" void aicore_execute_wrapper(
 
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);
-    if ((enable_profiling_flag & PROFILING_FLAG_L2_SWIMLANE) && l2_swimlane_aicore_rotation_table != 0) {
+    if ((enable_profiling_flag & SIMPLER_DFX_FLAG_L2_SWIMLANE) && l2_swimlane_aicore_rotation_table != 0) {
         // Stash only the slot pointer; deref happens lazily inside
         // get_l2_swimlane_aicore_head() once AICPU has populated the table. See
         // aicore_profiling_state.h.
@@ -151,7 +151,7 @@ extern "C" void aicore_execute_wrapper(
     } else {
         set_l2_swimlane_aicore_head_slot(nullptr);
     }
-    if ((enable_profiling_flag & PROFILING_FLAG_PMU) && aicore_pmu_ring_addrs != 0) {
+    if ((enable_profiling_flag & SIMPLER_DFX_FLAG_PMU) && aicore_pmu_ring_addrs != 0) {
         uint64_t *pmu_ring_table = reinterpret_cast<uint64_t *>(aicore_pmu_ring_addrs);
         set_aicore_pmu_ring(reinterpret_cast<__gm__ PmuAicoreRing *>(pmu_ring_table[block_idx]));
     } else {
@@ -165,7 +165,7 @@ extern "C" void aicore_execute_wrapper(
     //   physical_core_id [block_dim..3*block_dim-1]    = AIV pairs
     //                                                    (AIV0_c0, AIV1_c0, AIV0_c1, AIV1_c1, ...)
     // This mirrors the runtime's CoreTracker cluster assignment.
-    uint32_t block_dim = static_cast<uint32_t>(runtime->worker_count) / PLATFORM_CORES_PER_BLOCKDIM;
+    uint32_t block_dim = static_cast<uint32_t>(runtime->get_worker_count()) / PLATFORM_CORES_PER_BLOCKDIM;
     uint32_t cluster_id;
     uint32_t subblock_id;
     if (core_type == CoreType::AIC) {

@@ -171,62 +171,60 @@ TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
     sched.on_scope_end(ptrs, N);
 
     for (int i = 0; i < N; i++) {
-        EXPECT_EQ(slots[i].fanout_refcount.load(), 1);
+        // on_scope_end releases the owning-scope ref via release_producer_scope,
+        // which adds PTO2_FANOUT_SCOPE_BIT (bit31) to fanout_refcount.
+        EXPECT_EQ(slots[i].fanout_refcount.load(), PTO2_FANOUT_SCOPE_BIT);
     }
 }
 
 // =============================================================================
-// get_ready_tasks_batch: local buffer first
+// get_ready_tasks_batch: drains the shared ready queue
 // =============================================================================
 
-TEST_F(SchedulerStateTest, GetReadyTasksBatchLocalFirst) {
+TEST_F(SchedulerStateTest, GetReadyTasksBatchDrainsSharedQueue) {
     alignas(64) PTO2TaskSlotState slot_a, slot_b;
-    init_slot(slot_a, PTO2_TASK_PENDING, 0, 1);
+    // fanin_count = 1 so a single release_fanin_and_check_ready call drives each
+    // slot to ready (new_refcount 0->1 == fanin_count) and enqueues it.
+    init_slot(slot_a, PTO2_TASK_PENDING, 1, 1);
     init_slot(slot_b, PTO2_TASK_PENDING, 1, 1);
 
-    PTO2TaskSlotState *local_buf_storage[4];
-    PTO2LocalReadyBuffer local_buf;
-    local_buf.reset(local_buf_storage, 4);
-    local_buf.try_push(&slot_a);
-
-    // Use src API to route slot_b into the global ready queue
-    sched.release_fanin_and_check_ready(slot_b);
+    // Route both slots into the global ready queue via the src API.
+    ASSERT_TRUE(sched.release_fanin_and_check_ready(slot_a));
+    ASSERT_TRUE(sched.release_fanin_and_check_ready(slot_b));
 
     PTO2TaskSlotState *out[4];
-    int count = sched.get_ready_tasks_batch(PTO2ResourceShape::AIC, local_buf, out, 4);
+    int count = sched.get_ready_tasks_batch(PTO2ResourceShape::AIC, out, 4);
 
     EXPECT_EQ(count, 2);
-    // Local buffer drains first (LIFO), so slot_a comes first
+    // Shared queue is FIFO, so slot_a (pushed first) comes first.
     EXPECT_EQ(out[0], &slot_a);
     EXPECT_EQ(out[1], &slot_b);
 }
 
-TEST(CoreTrackerTest, MixPendingRejectsPartiallyRunningCluster) {
+TEST(CoreTrackerTest, MixPartiallyRunningClusterAdmittedAsPerCorePlacement) {
     CoreTracker tracker;
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
 
     constexpr int32_t cluster_offset = 0;
-    tracker.change_core_state(cluster_offset + 1);  // AIV0 running, AIC/AIV1 idle
+    tracker.change_core_state(cluster_offset + 1);  // AIV0 running (unrelated task), AIC/AIV1 idle
     tracker.clear_pending_occupied(cluster_offset + 1);
 
     EXPECT_TRUE(tracker.is_aic_core_idle(cluster_offset));
     EXPECT_FALSE(tracker.is_aiv0_core_idle(cluster_offset));
     EXPECT_TRUE(tracker.is_aiv1_core_idle(cluster_offset));
 
-    const bool would_place_aic_pending = !tracker.is_aic_core_idle(cluster_offset);
-    const bool would_place_aiv0_pending = !tracker.is_aiv0_core_idle(cluster_offset);
-    const bool would_place_aiv1_pending = !tracker.is_aiv1_core_idle(cluster_offset);
-    EXPECT_FALSE(would_place_aic_pending);
-    EXPECT_TRUE(would_place_aiv0_pending);
-    EXPECT_FALSE(would_place_aiv1_pending);
+    // A 1C2V MIX task is admitted on this partial cluster as a PENDING placement.
+    // Per-core dispatch then puts the idle AIC/AIV1 on their running slots (marked
+    // running so the completion poller tracks them) and the busy AIV0 on its pending
+    // slot, executing after the in-flight AIV-only task.
+    constexpr uint8_t used_mask = PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0 | PTO2_SUBTASK_MASK_AIV1;
+    EXPECT_EQ(tracker.classify_mix_cluster(cluster_offset, used_mask), CoreTracker::MixPlacement::PENDING);
 
+    // Not all used cores are idle, so the IDLE phase skips this cluster; it is
+    // consumed by the PENDING phase.
     auto idle = tracker.get_idle_core_offset_states(PTO2ResourceShape::MIX);
     EXPECT_FALSE(idle.has_value());
-
-    auto pending = tracker.get_pending_core_offset_states(PTO2ResourceShape::MIX);
-    EXPECT_FALSE(pending.has_value()) << "Pending admission here would split one MIX block across running AIC/AIV1 "
-                                      << "placement and pending AIV0 placement.";
 }
 
 TEST(CoreTrackerTest, MixPendingAcceptsFullyRunningClusterWithFreePendingSlots) {
@@ -301,7 +299,7 @@ TEST(CoreTrackerTest, MixClassifyAllowsPendingForUsedRunningCoresOnly) {
     EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
 }
 
-TEST(CoreTrackerTest, MixClassifyRejectsMixedUsedCores) {
+TEST(CoreTrackerTest, MixClassifyAdmitsMixedUsedCoresAsPending) {
     CoreTracker tracker;
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
@@ -309,8 +307,10 @@ TEST(CoreTrackerTest, MixClassifyRejectsMixedUsedCores) {
     constexpr int32_t cluster_offset = 0;
     tracker.change_core_state(cluster_offset + 1);  // AIV0 running while AIC is idle
 
+    // Mixed used-core state (AIC idle, AIV0 running) is admitted as PENDING; the
+    // idle AIC takes its running slot and the busy AIV0 takes its pending slot.
     auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
-    EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
+    EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
 }
 
 TEST(CoreTrackerTest, MixClassifyRejectsOccupiedPendingSlotInUsedMask) {

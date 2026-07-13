@@ -33,6 +33,26 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
 
+# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: opt-in overlay that wires the PTO-ISA
+# async-SDMA workspace into comm_alloc_windows. When ON it pulls in pto-isa
+# headers and CANN-9.0+ aclnn symbols (aclnnShmemSdmaStarsQuery*) and links
+# libnnopbase, so it requires a CANN drop that actually exposes working a5
+# SDMA primitives. Default OFF because the available a5 CANN drops break
+# (AICPU exception -> 507018, or HCCL_E_INTERNAL). See
+# docs/a5-sdma-overlay.md for the full isolation status and re-enable steps
+# (#1315).
+# Flip ON via -DSIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON (or the env var of the
+# same name, forwarded by simpler_setup/runtime_builder.py).
+option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE "Enable a5 PTO SDMA workspace overlay" OFF)
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    if(NOT DEFINED ENV{PTO_ISA_ROOT})
+        message(FATAL_ERROR
+            "a5 onboard host_runtime with SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON requires PTO_ISA_ROOT "
+            "(needs pto-isa headers + CANN 9.0+ with a5 SDMA primitives)")
+    endif()
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
+endif()
+
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES
@@ -43,11 +63,11 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l2_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/dep_gen_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/tensor_dump_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
 )
 # Add common/aicpu_loader/host sources (LoadAicpuOp)
@@ -60,6 +80,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l3_l2_orch_comm_service.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -96,6 +117,10 @@ target_compile_options(host_runtime
 # src/common/platform/shared/host/platform_compile_info.cpp.
 target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5")
 
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
+endif()
+
 # Include directories - always include local headers
 target_include_directories(host_runtime
     PRIVATE
@@ -131,11 +156,16 @@ endif()
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled
+# HcclGetRootInfo/HcclCommInitRootInfo are declared weak in CANN's hccl_comm.h.
+# Under a toolchain that defaults to --as-needed (Ubuntu/conda gcc on x86), a
+# weak undefined ref does not mark libhcomm "needed", so its DT_NEEDED is
+# dropped and the symbols resolve to NULL at runtime -> SIGSEGV on the first
+# HcclGetRootInfo call. Force the dependency so it survives any default. See #1018.
 target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
-        ${HCCL_LINK_TARGETS}
+        -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
         dl
 )
 
@@ -144,6 +174,11 @@ target_link_directories(host_runtime
         ${ASCEND_HOME_PATH}/lib64
         ${ASCEND_HOME_PATH}/runtime/lib64
 )
+
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    target_link_directories(host_runtime PRIVATE ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64)
+    target_link_libraries(host_runtime PRIVATE nnopbase)
+endif()
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
 

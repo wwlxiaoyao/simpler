@@ -218,8 +218,13 @@ collected_on_host + dropped == total              (a2a3, 2 buckets)
 AICPU reads the 8 PMU counters via MMIO (`read_reg(reg_base, PMU_CNTi)`)
 directly into a `PmuRecord` on every task FIN. Buffers rotate through
 an SPSC free queue per core; full buffers flow through a per-thread
-ready queue to a host mgmt thread that recycles them, while a host
-poll thread streams records to CSV during execution.
+ready queue to host drain/refill shards. Drain refills free queues from
+shard-local recycled lanes; collector shards stream records to CSV during
+execution, and the replenish thread folds done buffers back into recycled
+lanes and tops up optional recycled watermarks without writing device free
+queues. PMU has no init-seeded recycled surplus by default, so the runtime
+watermark is only a minimal reserve batch rather than a core-count-scaled
+extra allocation target.
 
 ```text
         HOST                                         DEVICE
@@ -233,20 +238,20 @@ poll thread streams records to CSV during execution.
 │                          │               │                          │
 │ start(tf)                │               │ per-task FIN:            │
 │   ┌────────────────────┐ │               │   read 8 PMU_CNTs+TOTAL  │
-│   │ mgmt thread        │ │               │     into records[count]  │
-│   │ (BufferPool driver)│ │ SPSC ready    │   if buffer full:        │
+│   │ drain/refill shard │ │               │     into records[count]  │
+│   │ + replenish thread │ │ SPSC ready    │   if buffer full:        │
 │   │   poll ready queue │<┼──queues──────<│     push ready entry,    │
-│   │   recycle buffers  │─┼──free queue──>│     pop next buffer      │
+│   │   refill freeQ     │─┼──free queue──>│     pop next buffer      │
 │   └────────────────────┘ │               │                          │
 │   ┌────────────────────┐ │ shared mem    │ pmu_aicpu_flush():       │
-│   │ poll thread        │ │ mapping       │   push remaining full    │
+│   │ collector shard    │ │ mapping       │   push remaining full    │
 │   │   read records via │<┼──────────────<│   buffers to ready_q     │
 │   │   host mapping     │ │               │                          │
 │   │   append to CSV    │ │               │                          │
 │   └────────────────────┘ │               └──────────────────────────┘
 │                          │
 │ stop()                   │
-│   join mgmt → join poll  │
+│   join mgmt → collectors │
 │ reconcile_counters()     │
 │ finalize()               │
 └──────────────────────────┘
@@ -278,13 +283,15 @@ PmuBuffer pool (rotated)                        (BUFFERS_PER_CORE per core)
 init_pmu()
   pmu_collector_.init(num_aicore, num_threads, csv_path, event_type, ...)
   kernel_args_.args.pmu_data_base = pmu_collector_.get_pmu_shm_device_ptr()
-start(tf)                       ← spawn mgmt thread (drains AICPU L1 ready
-                                  queue, recycles full buffers via
-                                  BufferPoolManager) + poll thread (drains
-                                  L2 hand-off, appends to CSV)
+start(tf)                       ← spawn split mgmt threads (drain AICPU ready
+                                  queues and refill free queues from
+                                  recycled lanes; replenish drains done
+                                  buffers into recycled lanes)
+                                  + collector shards (drain host hand-off,
+                                  append to CSV)
 launch AICPU / AICore
 rtStreamSynchronize             ← wait for kernel completion
-stop()                          ← join mgmt → join poll
+stop()                          ← join mgmt/replenish → join collectors
 reconcile_counters()            ← assert collected + dropped == total;
                                   any non-empty current_buf_ptr is a
                                   flush bug, logged as ERROR
@@ -294,13 +301,13 @@ finalize(unregister, free)
 [`PmuCollector`](../src/a2a3/platform/include/host/pmu_collector.h)
 inherits from
 [`profiling_common::ProfilerBase<PmuCollector, PmuModule>`](../src/common/platform/include/host/profiler_base.h):
-the base class owns the mgmt thread, the poll thread, and the
+the base class owns split mgmt threads, collector shards, and the
 `BufferPoolManager<PmuModule>` they share. `PmuCollector` only supplies
 the PMU-specific pieces — the `PmuModule` trait that describes the
 shared-memory layout, an `init()` that allocates and pre-fills the free
 queues, an `on_buffer_collected()` callback that appends records to the
-CSV, and `reconcile_counters()` / `finalize()`. The mgmt/poll threading,
-buffer pooling, and `Module` trait pattern are shared with TensorDump
+CSV, and `reconcile_counters()` / `finalize()`. The mgmt/collector threading,
+buffer pooling, and `Module` trait pattern are shared with ArgsDump
 and L2Swimlane — see [profiling-framework.md](../profiling-framework.md) for
 the framework reference.
 
@@ -317,9 +324,12 @@ a2a3). At shutdown, AICPU flushes any partially-filled buffers via
 `pmu_aicpu_flush_buffers()`.
 
 a5's `PmuCollector` derives from
-`ProfilerBase<PmuCollector, PmuModule>` and shares the mgmt + poll
-thread structure with a2a3. The single behavioral deviation from
-§5.2 is the **transport channel**: a5 has no `halHostRegister`, so
+`ProfilerBase<PmuCollector, PmuModule>` and uses the same framework
+abstractions as a2a3, including the same split mgmt + collector shard
+shape (`kMgmtDrainThreadCount` = `kCollectorThreadCount` =
+`PLATFORM_MAX_AICPU_THREADS`, i.e. 7 on a5 vs 4 on a2a3). The
+behavioral deviation from §5.2 is the **transport channel**: a5 has no
+`halHostRegister`, so
 each device buffer is paired with a host-shadow `malloc()` and the
 mgmt loop synchronizes the two via `profiling_copy.h` (`rtMemcpy`
 onboard, `memcpy` in sim). `MemoryOps` therefore carries five
@@ -357,7 +367,7 @@ still pulled on demand inside
 │   for each ready entry:  │               │     records[count]       │
 │     copy buf from device │<──memcpy─────<│   fill func_id/core_type │
 │     resolve host ptr     │               │   ++count                │
-│     push to L2 ready_q   │               │   if buffer full:        │
+│     push to host ready_q │               │   if buffer full:        │
 │   advance queue_heads,   │               │     push ready entry,    │
 │     refill free_queues   │               │     pop next from free_q │
 │   write_range_to_device  │──memcpy──────>│                          │
@@ -483,7 +493,7 @@ device-side counters.
 | Counter readout | AICPU MMIO `read_reg` | AICore MMIO `ld_dev` |
 | Per-core staging | direct write into `records[count]` | dual-issue slots, AICPU commits on FIN |
 | Buffer model | rotating pool (free + ready queues, SPSC protocol) | identical |
-| Host threads | mgmt + poll, streams during execution | identical |
+| Host threads | split mgmt + collector shards, streams during execution | same split mgmt + collector shards (7 = `PLATFORM_MAX_AICPU_THREADS` vs a2a3's 4) |
 | Host-class shape | `ProfilerBase<PmuCollector, PmuModule>` | identical |
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
@@ -499,9 +509,10 @@ counter-read code paths are skipped.
 When enabled, the dominant per-task overhead is the MMIO counter read
 (8 reads on a2a3, 10 on a5) plus a single record copy. On both
 architectures, streaming keeps host-side work off the critical path —
-the collector thread drains buffers concurrently with kernel execution.
-On a5 the copy hooks add `rtMemcpy` round-trips that a2a3's shared
-memory avoids, but these overlap with device execution.
+the collector shards drain buffers concurrently with kernel execution.
+Both a2a3 and a5 use split mgmt plus collector shards (a5 with 7 shards,
+a2a3 with 4). a5's copy hooks add `rtMemcpy` round-trips that a2a3's
+shared memory avoids, but these overlap with device execution.
 
 For meaningful per-task numbers on a2a3 the runtime collapses to
 single-issue dispatch automatically whenever `--enable-pmu` is set (see
@@ -597,12 +608,12 @@ covers every core that produced records.
 **Dropped records on a2a3.** `PmuBufferState::dropped_record_count`
 nonzero means the AICPU could not get a free buffer in time
 (`free_queue` empty). Increase `PLATFORM_PMU_BUFFERS_PER_CORE` so the
-mgmt thread has more headroom to recycle buffers.
+host drain/replenish path has more buffer headroom.
 
 **Dropped records on a5.** `PmuBufferState::dropped_record_count`
 nonzero means the AICPU could not get a free buffer in time
 (`free_queue` empty). Increase `PLATFORM_PMU_BUFFERS_PER_CORE` so the
-collector thread has more headroom to recycle buffers.
+host drain/replenish path has more buffer headroom.
 
 ## 9. Related docs
 

@@ -107,12 +107,13 @@ meaning, peak, and capacity use; `Max use` shows the selected risk metric,
 peak, capacity, use, peak scope, and peak site. For TensorMap, `Max use` also
 shows `Peak context ring_depth`, which is the scope/ring_depth context where
 the global TensorMap peak was observed. `task_window`, `heap`, and `dep_pool`
-put `High water` / `Live at exit` in the main resource-pressure chart, and put
-`Scope alloc` in a separate chart below it so small allocation changes stay
-readable. `tensormap` shows one global live-entry curve. Charts include
-scope-index ticks on x and observed-usage ticks on y. Percentages are rendered
-with two decimal places. The x-axis uses readable integer scope steps; the
-y-range is `peak * 1.1`, while y-grid ticks use readable integer or
+put `High water` / `Live at exit` in the main resource-pressure chart, and
+render the per-scope allocation curve in a separate chart below it so small
+allocation changes stay readable. `tensormap` shows one global live-entry
+curve. Charts include scope-index ticks on x and observed-usage ticks on y.
+Percentages are rendered with two decimal places. The x-axis uses readable
+integer scope steps; the y-range is `peak * 1.1`, while y-grid ticks use
+readable integer or
 human-friendly steps. Hovering a point shows a highlighted dot plus its metric,
 scope index, y value, and source site. Clicking any chart opens a larger modal
 view of that chart; closing the modal releases the cloned SVG.
@@ -286,8 +287,8 @@ after one bool load.
 
 A scope costs exactly two collector calls — `begin` and `end` — each
 carrying that boundary's sample for the scope's own ring. The dep-pool values
-come from scheduler-published snapshots; wiring is asynchronous, so this
-diagnostic can lag the submit path slightly. The runtime gates both on the local
+come from orchestrator-published snapshots taken during Orch-side wiring, so
+they track the submit path directly. The runtime gates both on the local
 weak `is_scope_stats_enabled()` stub first, so a disabled run pays neither the
 cross-`.so` calls nor the cross-agent `active_count()` read (same idiom as
 `is_dep_gen_enabled`).
@@ -308,7 +309,7 @@ render `used/cap` without a second device→host query.
 | PMU | platform only | all runtimes | reads hardware registers |
 | L2 swimlane | platform only | all runtimes | reads AICore ring buffers |
 | dep_gen | platform only | all runtimes | traces `submit_task` |
-| tensor dump | platform only | all runtimes | dumps tensor data |
+| args dump | platform only | all runtimes | dumps argument data |
 | **scope stats** | **platform API + runtime call sites** | **T&R only** | runtime extracts values, platform tracks peaks |
 
 ### 4.4 Symbol resolution
@@ -330,7 +331,7 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
   set kernel_args fields             runtime: scope_stats_set_ring_capacity()
   launch kernel                      runtime: scope_stats_set_tensormap_capacity()
       │                                  │
-  poll thread:                       on PTO2_SCOPE begin/end:
+  collector shard(s):                on PTO2_SCOPE begin/end:
    append records to memory  ◀──┐      runtime samples task/heap/dep_pool/tensormap
       │                         │      runtime: scope_stats_begin()/end()
       │                         │         └─ emit record, append to buffer;

@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -78,6 +79,10 @@ uint64_t get_sys_cnt_aicpu() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
 }
 
+void cache_invalidate_range(const void * /* addr */, size_t /* size */) {}
+
+void cache_flush_range(const void * /* addr */, size_t /* size */) {}
+
 // =============================================================================
 // platform_regs.h stub (get_reg_ptr)
 // =============================================================================
@@ -86,10 +91,41 @@ uint64_t get_sys_cnt_aicpu() {
 // early-dispatch) is an inline that resolves a register id to its MMIO pointer
 // via get_reg_ptr and writes a 64-bit token through it. There is no MMIO on the
 // host UT runner; hand back writable static storage (8 bytes — the doorbell is a
-// 64-bit store) so the inline links and any write is harmless.
-volatile uint32_t *get_reg_ptr(uint64_t /* reg_base_addr */, RegId /* reg */) {
-    static volatile uint64_t dummy_reg = 0;
-    return reinterpret_cast<volatile uint32_t *>(&dummy_reg);
+// 64-bit store) and retain the requested base address for ownership tests.
+static volatile uint64_t g_test_reg = 0;
+static uint64_t g_test_reg_base_addr = 0;
+
+volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId /* reg */) {
+    g_test_reg_base_addr = reg_base_addr;
+    return reinterpret_cast<volatile uint32_t *>(&g_test_reg);
+}
+
+void reset_test_reg_stub() {
+    g_test_reg = 0;
+    g_test_reg_base_addr = 0;
+}
+
+uint64_t get_test_reg_stub_value() { return g_test_reg; }
+
+uint64_t get_test_reg_stub_base_addr() { return g_test_reg_base_addr; }
+
+// =============================================================================
+// runtime_maker.cpp stub (bind_callable_to_runtime_impl)
+// =============================================================================
+
+// DeviceRunnerBase::bind_callable_to_runtime (the merged bind facade) calls the
+// runtime's bind_callable_to_runtime_impl, which is defined in runtime_maker.cpp
+// and only present in the production host_runtime.so. These runner-only unit
+// tests link device_runner_base.cpp without any runtime_maker, and their mock
+// runners never bind (TestSimRunner::run returns 0), so the impl is never
+// invoked — it only has to resolve at link time. Keep it weak so tests that
+// link a real runtime_maker.cpp use the real bind implementation instead.
+extern "C" __attribute__((weak)) int bind_callable_to_runtime_impl(
+    void * /* runtime */, const void * /* api */, const void * /* orch_args */, void * /* host_orch_func_ptr */,
+    const void * /* signature */, int /* sig_count */, const uint64_t * /* ring_task_window */,
+    const uint64_t * /* ring_heap */, const uint64_t * /* ring_dep_pool */
+) {
+    return -1;
 }
 
 // =============================================================================

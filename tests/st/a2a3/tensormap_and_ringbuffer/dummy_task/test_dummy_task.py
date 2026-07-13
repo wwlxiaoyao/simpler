@@ -57,8 +57,7 @@ class TestDummyTask(SceneTestCase):
                 "name": "WRITE_CONST",
                 "source": "kernels/aic/kernel_write_const.cpp",
                 "core_type": "aic",
-                # Single-AIC task with one INOUT tensor (args[0]). Declared so
-                # the tensor dump's per-subtask sum matches the payload.
+                # Single-AIC task with one INOUT tensor at payload slot 0.
                 "signature": [D.INOUT],
             },
             {
@@ -90,6 +89,16 @@ class TestDummyTask(SceneTestCase):
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 2, "block_dim": 1},
             "params": {"case": 3},
+        },
+        {
+            # One producer fanned out to 18 dummy barriers, then one consumer
+            # depending on all 18 — both degrees exceed the dense-dependency
+            # warn threshold (16), exercising the orchestrator's fanout and
+            # fanin diagnostics. Correctness is still just the copy.
+            "name": "DenseFanoutFanin",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 2, "block_dim": 1},
+            "params": {"case": 4},
         },
     ]
 

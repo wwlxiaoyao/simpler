@@ -482,7 +482,7 @@ static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must
  * a single discriminator byte:
  *
  *   OUTER (mutually time-exclusive within an iter; emit advances _t0_phase):
- *     Complete, Dispatch, Release, Wire, Dummy, EarlyDispatch.
+ *     Complete, Dispatch, Release, Dummy, EarlyDispatch.
  *     Every iter is a sequence of zero-or-more outer bars + optional gap.
  *
  *   INNER (no anchor advance; Perfetto auto-nests by time containment):
@@ -504,21 +504,28 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                         // tasks_processed = subtasks published this iter.
     Release = 2,        // Deferred-release drain (on_task_release work).
                         // tasks_processed = slots released this iter.
-    Wire = 3,           // drain_wiring_queue: pop wired tasks into ready queues.
-                        // tasks_processed = wired count.
     Dummy = 4,          // dummy_drain outer bar: covers handling of all dummies
                         // popped this iter. tasks_processed = dummy_got count.
-    EarlyDispatch = 5,  // try_speculative_early_dispatch: speculative pre-staging
+    EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging
                         // of a flagged producer's consumer's gated blocks.
                         // tasks_processed = blocks staged this pass.
     // Inner (parent: Complete | Dummy)
     Resolve = 6,  // on_task_complete: walk consumer list, decrement fanin,
                   // push newly-ready successors, ring doorbells for
-                  // speculative hits. tasks_processed = # consumers visited.
+                  // early-dispatch hits. tasks_processed = # consumers visited.
     // Separate-lane (Worker View pid=4 AICPU_N)
-    DummyTask = 7,  // Per-dummy identity marker (zero-width). tasks_processed
-                    // = task_token_raw low 32 bits so deps.json flow arrows
-                    // can land on it.
+    DummyTask = 7,      // Per-dummy identity marker (zero-width). tasks_processed
+                        // = task_token_raw low 32 bits so deps.json flow arrows
+                        // can land on it.
+    Drain = 8,          // handle_drain_mode outer: the sync_start stop-the-world drain
+                        // (ack barrier + availability + parallel stage + finalize).
+                        // One bar per dispatch-loop iteration that enters the drain,
+                        // so retries show as multiple bars. Otherwise this time is a
+                        // swimlane blind spot (the loop `continue`s past all records).
+    DrainPrepare = 9,   // inner: this thread's drain_stage_cores prepare pass
+                        // (cluster scan + build_payload). tasks_processed = subtasks.
+    DrainPublish = 10,  // inner: this thread's drain_stage_cores publish pass
+                        // (MMIO write_reg per subtask). tasks_processed = subtasks.
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
@@ -535,27 +542,22 @@ constexpr int L2SWIMLANE_NUM_QUEUE_SHAPES = 3;
  * (zero for Complete). Kept named, not "extra1"/"extra2", so the device-side
  * commit and the host-side JSON emit don't drift on which extra means which.
  *
- * Queue-depth snapshots (local_depth_*, shared_depth_*) record the per-shape
- * scheduler queue occupancy at phase boundaries. They surface the
- * dep-release-then-discovery latency that head OH alone can't distinguish from
- * register-write latency: a phase whose start sees `local_depth=N, shared=0`
- * and end sees `local_depth=N-K` shows that K tasks were popped from this
- * thread's private buffer (invisible to peer threads) — peers must spin until
- * those tasks overflow into shared. Filled with 0 below SCHED_PHASES.
+ * Queue-depth snapshots (shared_depth_*) record the per-shape scheduler ready
+ * queue occupancy at phase boundaries. They surface the dep-release-then-
+ * discovery latency that head OH alone can't distinguish from register-write
+ * latency. Filled with 0 below SCHED_PHASES.
  */
 struct L2SwimlaneAicpuSchedPhaseRecord {
-    uint64_t start_time;                                        // Phase start timestamp
-    uint64_t end_time;                                          // Phase end timestamp
-    uint32_t loop_iter;                                         // Scheduler-loop iteration number on this thread
-    L2SwimlaneSchedPhaseKind kind;                              // see enum above
-    uint32_t tasks_processed;                                   // Tasks processed in this phase batch
-    uint32_t pop_hit;                                           // SCHED_DISPATCH delta since last emit (0 for Complete)
-    uint32_t pop_miss;                                          // SCHED_DISPATCH delta since last emit (0 for Complete)
-    int16_t local_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // this thread's PTO2LocalReadyBuffer.count
-    int16_t local_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
-    int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
+    uint64_t start_time;            // Phase start timestamp
+    uint64_t end_time;              // Phase end timestamp
+    uint32_t loop_iter;             // Scheduler-loop iteration number on this thread
+    L2SwimlaneSchedPhaseKind kind;  // see enum above
+    uint32_t tasks_processed;       // Tasks processed in this phase batch
+    uint32_t pop_hit;               // SCHED_DISPATCH delta since last emit (0 for Complete)
+    uint32_t pop_miss;              // SCHED_DISPATCH delta since last emit (0 for Complete)
+    int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // ready_queues[shape] + ready_sync_queues[shape]
     int16_t shared_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
-    uint32_t _pad;  // 64B alignment padding
+    uint32_t _pad[4];  // 64B alignment padding
 };
 static_assert(sizeof(L2SwimlaneAicpuSchedPhaseRecord) == 64, "L2SwimlaneAicpuSchedPhaseRecord layout drift");
 

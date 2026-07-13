@@ -19,17 +19,35 @@ tool supports two output formats:
 - html: Graphviz SVG wrapped in a self-contained pan/zoom HTML page
 
 In text mode the default view shows task identity ``(ring, local)`` together
-with ``kind=`` and ``func_id=``. Text-mode ``func_id=`` comes only from the
-three-slot ``kernel_ids`` layout and preserves ``[aic,aiv0,aiv1]`` with
-inactive slots kept as ``-1``; ``alloc`` / ``dummy`` tasks render as
-``func_id=none``. In HTML mode nodes are labeled ``(ring, local)`` only; they
-are colored by ``core_type`` when a perf sidecar is colocated (AIC blue, AIV
-orange).
+with ``kind=``, ``func_id=``, and SPMD block num when applicable. Text-mode
+``func_id=`` comes only from the three-slot ``kernel_ids`` layout and preserves
+``[aic,aiv0,aiv1]`` with inactive slots kept as ``-1``; ``alloc`` / ``dummy``
+tasks render as ``func_id=none``. ``SPMD block num = N`` is the logical block
+num captured from ``block_num``. In HTML mode SPMD nodes use a red border plus a
+transparent right-side ``xN`` block num label; nodes are colored by
+``core_type`` when a perf sidecar is colocated (AIC blue, AIV orange).
 
 Usage:
     python -m simpler_setup.tools.deps_viewer DEPS_JSON
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --format text
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --format html --engine sfdp
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode reduced
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode omitted
+
+``--edge-mode`` selects which edges are visible (structural transitive reduction,
+purely on ``(pred, succ)`` — per-edge tensor identity is ignored, and it is
+skipped with a warning if the graph contains a cycle):
+
+- ``full`` (default) — every edge.
+- ``reduced`` — the minimal edge set: drops every edge whose ordering is already
+  implied by a longer path (e.g. ``A->C`` when ``A->B->C`` exists).
+- ``omitted`` — only the redundant edges ``reduced`` would drop (its complement),
+  useful for auditing exactly which dependencies are transitively covered.
+
+``reduced`` and ``omitted`` print the redundant edges to stdout. Text output
+emits only the selected edge set. HTML output keeps every edge in the Graphviz
+layout and colors the unselected edges like the page background, preserving the
+full-graph layout while making the selected edge set visible.
 
 HTML output requires Graphviz installed (``brew install graphviz`` /
 ``apt install graphviz``). Text output does not.
@@ -40,6 +58,7 @@ import json
 import shutil
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 
 
@@ -195,6 +214,75 @@ def _load_deps_edges(deps_path):
     return sorted(edges), sorted(nodes), annotations, tensor_table, task_table
 
 
+def _transitive_reduction(edges, nodes):
+    """DAG transitive reduction on structural ``(pred, succ)`` edges.
+
+    An edge ``(u, v)`` is redundant when ``v`` is still reachable from ``u``
+    through some other path that does not use the direct ``(u, v)`` edge — i.e.
+    the dependency it expresses is already implied by a longer chain. Reduction
+    is purely structural: it ignores the per-edge tensor / arg annotations, so a
+    ``(u, v)`` carrying its own tensor is dropped whenever the ordering it
+    encodes is transitively covered.
+
+    Runs in ``O(V·E)``: nodes are visited in reverse topological order while a
+    descendant-reachability set is accumulated per node, so each edge is tested
+    with a single set membership rather than a fresh graph walk. Assumes every
+    edge endpoint is present in ``nodes`` (the caller's contract).
+
+    Returns ``(kept_edges, removed_edges, is_dag)``. ``kept_edges`` and
+    ``removed_edges`` preserve the order of the input ``edges`` (so passing the
+    sorted list from ``_load_deps_edges`` yields sorted results without a second
+    sort). On a cyclic graph the input edges are returned unchanged with
+    ``is_dag=False`` (transitive reduction is only well-defined on a DAG); the
+    caller warns and emits the full graph.
+    """
+    succ: dict[int, set[int]] = {n: set() for n in nodes}
+    indeg: dict[int, int] = {n: 0 for n in nodes}
+    for u, v in edges:
+        if v not in succ[u]:
+            succ[u].add(v)
+            indeg[v] += 1
+
+    # Kahn topological sort doubles as the cycle check: if we can't drain every
+    # node, a cycle remains and reduction would be ill-defined. Keep the drain
+    # order so we can walk it in reverse (descendants before ancestors).
+    remaining = dict(indeg)
+    queue = deque(n for n, d in remaining.items() if d == 0)
+    topo_order: list[int] = []
+    while queue:
+        n = queue.popleft()
+        topo_order.append(n)
+        for m in succ[n]:
+            remaining[m] -= 1
+            if remaining[m] == 0:
+                queue.append(m)
+    if len(topo_order) != len(succ):
+        return list(edges), [], False
+
+    # Reverse topological order guarantees every successor's reachability set is
+    # already final before we process a node. For node u, an edge (u, v) is
+    # redundant iff v lies in the reachability set of some *other* successor of
+    # u (v is reachable via a length >= 2 path); indirect collects those.
+    reach: dict[int, set[int]] = {}
+    redundant: set[tuple[int, int]] = set()
+    for u in reversed(topo_order):
+        indirect: set[int] = set()
+        for v in succ[u]:
+            indirect |= reach[v]
+        for v in succ[u]:
+            if v in indirect:
+                redundant.add((u, v))
+        node_reach = set(succ[u])
+        node_reach |= indirect
+        reach[u] = node_reach
+
+    # edges arrives already sorted (from _load_deps_edges); filtering preserves
+    # that order, so kept/removed stay sorted without a second sort.
+    kept = [e for e in edges if e not in redundant]
+    removed = [e for e in edges if e in redundant]
+    return kept, removed, True
+
+
 def _backfill_output_tensor_ids(task_table, annotations):
     """Recover ``tensor_id`` for OUTPUT slots that the runtime hadn't
     materialized at submit time.
@@ -273,10 +361,31 @@ def _merge_task_meta_with_kernel_ids(meta, task_table, func_names=None):
             entry["func_labels"] = [
                 func_names.get(str(slot)) or func_names.get(slot) or f"f{slot}" if slot >= 0 else "-1" for slot in slots
             ]
-            if not entry.get("func_name") and entry["func_labels"]:
-                entry["func_name"] = entry["func_labels"][0]
+            # func_name = the ACTIVE slots' names, order-preserving-deduped.
+            # kernel_ids is [aic, aiv0, aiv1]: an AIC-only task shows the AIC
+            # name, an AIV-only task the AIV name (never the inactive slot's
+            # "-1"), and a MIX task both (e.g. "paged_attention_cce_aic +
+            # paged_attention_cce_aiv"). aiv0/aiv1 usually carry the same
+            # func_id (one AIV kernel on two cores), so the dedup collapses
+            # them to one name.
+            if not entry.get("func_name"):
+                active_names = []
+                for fid in valid_ids:
+                    nm = func_names.get(str(fid)) or func_names.get(fid) or f"f{fid}"
+                    if nm not in active_names:
+                        active_names.append(nm)
+                entry["func_name"] = " + ".join(active_names)
         elif any(s >= 0 for s in slots):
             entry["func_labels"] = [f"f{slot}" if slot >= 0 else "-1" for slot in slots]
+        if not entry.get("core_type"):
+            has_aic = slots[0] >= 0
+            has_aiv = slots[1] >= 0 or slots[2] >= 0
+            if has_aic and has_aiv:
+                entry["core_type"] = "mix"
+            elif has_aic:
+                entry["core_type"] = "aic"
+            elif has_aiv:
+                entry["core_type"] = "aiv"
     return merged
 
 
@@ -340,14 +449,19 @@ def _load_task_meta(deps_path, func_names=None):
     return meta
 
 
-def _label(task_id, meta, task_table, fmt_task):
+def _label(task_id, meta, task_table, fmt_task, marker=""):
     base = fmt_task(task_id)
-    kind = _task_kind(_normalize_task_id(task_id), meta, task_table)
+    pfx = f"{marker} " if marker else ""
+    normalized_task_id = _normalize_task_id(task_id)
+    kind = _task_kind(normalized_task_id, meta, task_table)
     if kind == "alloc":
-        return f"{base} · alloc"
+        return f"{pfx}{base} · alloc"
     if kind == "dummy":
-        return f"{base} · dummy"
-    return base
+        return f"{pfx}{base} · dummy"
+    func_name = (meta.get(normalized_task_id) or {}).get("func_name")
+    if func_name:
+        return f"{pfx}{base} · {func_name}"
+    return f"{pfx}{base}"
 
 
 _CORE_STYLE = {
@@ -379,10 +493,15 @@ _CORE_HEADER_COLOR = {
 _INPUT_BG = "#EAF2FF"
 _OUTPUT_BG = "#FFF2E5"
 _HEADER_FALLBACK = "#D8D8D8"
+_SPMD_COLOR = "#C62828"
 
 
 def _html_escape(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _dot_escape_label(text):
+    return str(text).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def _short_tensor_label(tid, tensor_table):
@@ -451,12 +570,13 @@ def _arg_row_html(arg, tensor_table, side):
     return f'<TR><TD ALIGN="LEFT" PORT="{port}" BGCOLOR="{bg}">{body}</TD></TR>'
 
 
-def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
+def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task, marker=""):
     """Build a Graphviz HTML-like label for a task node showing:
         - input rows (top)     INPUT + INOUT slots
-        - identity header      "(ring, local)"
+        - identity header      "<marker> (ring, local) · <func_name>"
         - output rows (bottom) INOUT + OUTPUT_EXISTING + OUTPUT slots
     INOUT slots appear in BOTH compartments (read-then-write semantics).
+    ``marker`` is the 🔥 / ⭐ early-dispatch badge (empty for most tasks).
     """
     args = task_entry.get("args") if task_entry else None
     if not isinstance(args, list):
@@ -465,17 +585,23 @@ def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
     outputs = [a for a in args if a.get("type") in ("INOUT", "OUTPUT", "OUTPUT_EXISTING")]
     core_type = meta_entry.get("core_type") if meta_entry else None
     header_bg = _CORE_HEADER_COLOR.get(core_type if isinstance(core_type, str) else "", _HEADER_FALLBACK)
+    border_attrs = f'BORDER="1" COLOR="{_SPMD_COLOR}"' if _task_block_num(task_entry) > 1 else 'BORDER="0"'
 
-    header_label = fmt_task(task_id)
+    ident = fmt_task(task_id)
+    func_name = meta_entry.get("func_name") if meta_entry else None
+    if func_name:
+        ident = f"{ident} · {func_name}"
+    if marker:
+        ident = f"{marker} {ident}"
 
     rows = []
     for a in inputs:
         rows.append(_arg_row_html(a, tensor_table, "in"))
-    rows.append(f'<TR><TD ALIGN="CENTER" BGCOLOR="{header_bg}"><B>{_html_escape(header_label)}</B></TD></TR>')
+    rows.append(f'<TR><TD ALIGN="CENTER" BGCOLOR="{header_bg}"><B>{_html_escape(ident)}</B></TD></TR>')
     for a in outputs:
         rows.append(_arg_row_html(a, tensor_table, "out"))
 
-    table = '<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3">' + "".join(rows) + "</TABLE>"
+    table = f'<TABLE {border_attrs} CELLBORDER="1" CELLSPACING="0" CELLPADDING="3">' + "".join(rows) + "</TABLE>"
     return table
 
 
@@ -521,6 +647,43 @@ def _task_func_id_label(task_id, meta, task_table):
     return "func_id=unknown"
 
 
+def _task_block_num(task_entry):
+    if not isinstance(task_entry, dict):
+        return 1
+    block_num = _normalize_small_int(task_entry.get("block_num"))
+    if block_num is None or block_num < 1:
+        return 1
+    return block_num
+
+
+def _task_blocks_text(task_entry):
+    block_num = _task_block_num(task_entry)
+    if block_num <= 1:
+        return ""
+    return f"SPMD block num = {block_num}"
+
+
+def _plain_node_attrs(task_id, meta, task_table, fmt_task, marker=""):
+    meta_entry = meta.get(task_id)
+    kind = _task_kind(task_id, meta, task_table)
+    if kind == "submit" and meta_entry:
+        style = _node_style(meta_entry.get("core_type"))
+    elif kind == "alloc":
+        style = _CORE_STYLE["alloc"]
+    else:
+        style = _DEFAULT_STYLE
+
+    task_entry = task_table.get(task_id)
+    label = _dot_escape_label(_label(task_id, meta, task_table, fmt_task, marker=marker))
+    label_attr = f'label="{label}"'
+    style_attr = style["style"]
+    if _task_block_num(task_entry) > 1:
+        extra = f', color="{_SPMD_COLOR}", penwidth=1.5'
+    else:
+        extra = ""
+    return f'{label_attr}, shape={style["shape"]}, style="{style_attr}", fillcolor="{style["fillcolor"]}"{extra}'
+
+
 def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None, task_table=None):
     """Render deps.json as grep-friendly plain text.
 
@@ -559,16 +722,20 @@ def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None
     for task_id in sorted_nodes:
         kind = _task_kind(task_id, meta, task_table)
         func_label = _task_func_id_label(task_id, meta, task_table)
+        block_label = _task_blocks_text(task_table.get(task_id))
+        task_labels = " ".join(label for label in (func_label, block_label) if label)
         lines.append(
-            f"TASK {fmt_task(task_id)} kind={kind} {func_label} "
+            f"TASK {fmt_task(task_id)} kind={kind} {task_labels} "
             f"fanin={len(pred_map.get(task_id, set()))} fanout={len(succ_map.get(task_id, set()))}"
         )
 
     for task_id in sorted_nodes:
         kind = _task_kind(task_id, meta, task_table)
         func_label = _task_func_id_label(task_id, meta, task_table)
+        block_label = _task_blocks_text(task_table.get(task_id))
+        task_labels = " ".join(label for label in (func_label, block_label) if label)
         lines.append("")
-        lines.append(f"=== TASK {fmt_task(task_id)} kind={kind} {func_label} ===")
+        lines.append(f"=== TASK {fmt_task(task_id)} kind={kind} {task_labels} ===")
 
         pred_peers = sorted(pred_map.get(task_id, set()), key=_sort_task_id_key)
         lines.append(f"FANIN {len(pred_peers)}")
@@ -583,11 +750,47 @@ def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None
     return "\n".join(lines) + "\n"
 
 
-def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=None, task_table=None):
+def _task_markers(nodes, edges, task_table):
+    """Map task_id -> marker string for the node label.
+
+    🔥 (fire): the task itself is a flagged early-dispatch producer
+        (deps.json ``early_dispatch`` — the submit had allow_early_resolve).
+    ⭐ (star): every one of the task's predecessors is 🔥 (and it has at
+        least one), so the task is fully fed by flagged producers.
+    A task can carry both.
+    """
+    pred_map: dict[int, set] = {}
+    for pred, succ in edges:
+        pred_map.setdefault(succ, set()).add(pred)
+
+    def _flagged(tid):
+        return bool((task_table.get(tid) or {}).get("early_dispatch"))
+
+    markers = {}
+    for tid in nodes:
+        fire = "🔥" if _flagged(tid) else ""
+        preds = pred_map.get(tid, set())
+        star = "⭐" if preds and all(_flagged(p) for p in preds) else ""
+        if fire or star:
+            markers[tid] = fire + star
+    return markers
+
+
+def emit_dot(
+    edges,
+    nodes,
+    meta,
+    direction="LR",
+    annotations=None,
+    tensor_table=None,
+    task_table=None,
+    show_tensor_info=None,
+    hidden_edges=None,
+):
     """Graphviz DOT source. Used internally to feed the layout engine before
     wrapping the SVG in HTML.
 
-    Two rendering modes selected by whether ``task_table`` is non-empty:
+    Two rendering modes selected by ``show_tensor_info``:
 
     1. Plain mode (``task_table`` is None or empty) — bare shape/color nodes,
        bare arrows. Used when only task-level structure is available.
@@ -599,10 +802,12 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
        tensor_id matches the edge's tensor_id.
     """
     fmt_task = _make_task_formatter(nodes)
-    show_tensor = bool(task_table)
     annotations = annotations or {}
     tensor_table = tensor_table or {}
     task_table = task_table or {}
+    hidden_edges = set(hidden_edges or ())
+    show_tensor = bool(task_table) if show_tensor_info is None else bool(show_tensor_info and task_table)
+    markers = _task_markers(nodes, edges, task_table)
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",
@@ -612,27 +817,28 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
     ]
     for n in nodes:
         m = meta.get(n)
+        marker = markers.get(n, "")
         if show_tensor and n in task_table:
-            html = _task_node_html(n, task_table.get(n), m, tensor_table, fmt_task)
+            html = _task_node_html(n, task_table.get(n), m, tensor_table, fmt_task, marker=marker)
             lines.append(f"  {_node_id(n)} [shape=none, margin=0, label=<{html}>];")
             continue
-        kind = _task_kind(n, meta, task_table)
-        if kind == "submit" and m:
-            style = _node_style(m.get("core_type"))
-        elif kind == "alloc":
-            style = _CORE_STYLE["alloc"]
-        else:
-            style = _DEFAULT_STYLE
-        label = _label(n, meta, task_table, fmt_task).replace("\\", "\\\\").replace('"', '\\"')
-        attrs = f'label="{label}", shape={style["shape"]}, style="{style["style"]}", fillcolor="{style["fillcolor"]}"'
-        lines.append(f"  {_node_id(n)} [{attrs}];")
+        lines.append(f"  {_node_id(n)} [{_plain_node_attrs(n, meta, task_table, fmt_task, marker=marker)}];")
+
+    def edge_attr_str(edge_attrs):
+        return (" [" + ", ".join(edge_attrs) + "]") if edge_attrs else ""
+
+    def hidden_edge_attrs():
+        return ['color="#eef2f7"', 'fontcolor="#eef2f7"']
+
     for pred, succ in edges:
+        hidden = (pred, succ) in hidden_edges
+        hidden_attrs = hidden_edge_attrs() if hidden else []
         if not show_tensor:
-            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
+            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)}{edge_attr_str(hidden_attrs)};")
             continue
         rows = annotations.get((pred, succ), [])
         if not rows:
-            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
+            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)}{edge_attr_str(hidden_attrs)};")
             continue
         for row in rows:
             arg = row.get("arg")
@@ -641,19 +847,21 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
             tail = ""
             head = ""
             edge_attrs = []
+            if hidden:
+                edge_attrs.extend(hidden_edge_attrs())
             arg_idx = _normalize_small_int(arg)
             if arg_idx is not None and arg_idx >= 0:
                 head = f":in_{arg_idx}:w"
             out_port = _producer_output_port(task_table.get(pred), tid)
             if out_port:
                 tail = f":{out_port}:e"
-            if source == "explicit":
+            if source == "explicit" and not hidden:
                 edge_attrs.append('style="dashed"')
                 edge_attrs.append('color="#B0B0B0"')
             overlap = row.get("overlap")
-            if overlap and overlap != "covered":
+            if overlap and overlap != "covered" and not hidden:
                 edge_attrs.append(f'label="{_html_escape(overlap)}", fontsize=8, fontcolor="#C04040"')
-            attr_str = (" [" + ", ".join(edge_attrs) + "]") if edge_attrs else ""
+            attr_str = edge_attr_str(edge_attrs)
             lines.append(f"  {_node_id(pred)}{tail} -> {_node_id(succ)}{head}{attr_str};")
     lines.append("}")
     return "\n".join(lines) + "\n"
@@ -677,32 +885,73 @@ def render_svg(dot_text, engine="dot"):
     return proc.stdout
 
 
+def _spmd_badges_json(nodes, task_table):
+    task_table = task_table or {}
+    badges = {}
+    for task_id in nodes:
+        block_num = _task_block_num(task_table.get(task_id))
+        if block_num > 1:
+            badges[_node_id(task_id)] = block_num
+    return json.dumps(badges, sort_keys=True, separators=(",", ":"))
+
+
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>deps.json — {n_nodes} nodes, {n_edges} edges</title>
 <style>
-  html, body {{ margin: 0; height: 100%; background: #fafafa; font-family: -apple-system, sans-serif; }}
-  #hud {{ position: fixed; top: 8px; left: 8px; background: #fff; padding: 6px 10px;
-         border: 1px solid #ddd; border-radius: 4px; font-size: 12px; z-index: 10;
-         box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
-  #hud kbd {{ font-family: ui-monospace, monospace; background: #f0f0f0;
-              padding: 1px 4px; border-radius: 2px; }}
-  #legend {{ position: fixed; top: 8px; right: 8px; background: #fff; padding: 6px 10px;
-             border: 1px solid #ddd; border-radius: 4px; font-size: 12px; z-index: 10;
-             box-shadow: 0 1px 3px rgba(0,0,0,0.08); display: flex; gap: 12px; align-items: center; }}
-  #legend .swatch {{ display: inline-flex; align-items: center; gap: 4px; }}
+  html, body {{
+    margin: 0; height: 100%; background: #f8fafc;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+    color: #0f172a; overflow: hidden; -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }}
+  #hud, #legend {{
+    position: fixed; z-index: 10; display: flex; align-items: center;
+    background: rgba(255,255,255,0.94); border: 1px solid rgba(203,213,225,0.9);
+    border-radius: 10px; color: #0f172a; font-size: 12px;
+    box-shadow: 0 10px 26px rgba(15,23,42,0.10); backdrop-filter: blur(10px);
+  }}
+  #hud {{ top: 12px; left: 12px; gap: 8px; padding: 8px 12px; }}
+  #hud .stat {{ font-weight: 600; color: #020617; }}
+  #hud .muted {{ color: #cbd5e1; }}
+  #hud .divider {{ width: 1px; height: 16px; margin: 0 4px; background: #e2e8f0; }}
+  #hud kbd {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f1f5f9;
+    border: 1px solid #cbd5e1; color: #334155; padding: 1px 5px; border-radius: 5px;
+  }}
+  #legend {{
+    top: 12px; right: 12px; gap: 12px; padding: 8px 12px;
+    flex-wrap: wrap; max-width: min(760px, calc(100vw - 24px));
+  }}
+  #legend .swatch {{ display: inline-flex; align-items: center; gap: 6px; color: #334155; white-space: nowrap; }}
   #legend svg {{ display: block; }}
-  #stage {{ width: 100vw; height: 100vh; overflow: hidden; cursor: grab; }}
+  #stage {{ width: 100vw; height: 100vh; overflow: hidden; cursor: grab; background:
+    radial-gradient(circle at 20px 20px, rgba(100,116,139,0.18) 1px, transparent 1px), #eef2f7;
+    background-size: 24px 24px; }}
   #stage.panning {{ cursor: grabbing; }}
-  #stage > svg {{ transform-origin: 0 0; transition: none; max-width: none; }}
+  #stage > svg {{
+    transform-origin: 0 0; transition: none; max-width: none; overflow: visible;
+    filter: drop-shadow(0 16px 28px rgba(15,23,42,0.10));
+  }}
+  #stage .node path, #stage .node ellipse, #stage .node polygon {{
+    filter: drop-shadow(0 3px 4px rgba(15,23,42,0.18));
+  }}
+  #stage .edge path, #stage .edge polygon {{ opacity: 0.78; }}
 </style>
 </head>
 <body>
 <div id="hud">
-  {n_nodes} nodes · {n_edges} edges &nbsp;|&nbsp;
-  <kbd>drag</kbd> pan &nbsp; <kbd>wheel</kbd> zoom &nbsp; <kbd>f</kbd> fit &nbsp; <kbd>r</kbd> reset
+  <span class="stat">{n_nodes} nodes</span>
+  <span class="muted">·</span>
+  <span class="stat">{n_edges} edges</span>
+  <span class="divider"></span>
+  <kbd>drag</kbd><span>pan</span>
+  <kbd>wheel</kbd><span>zoom</span>
+  <kbd>f</kbd><span>fit</span>
+  <kbd>r</kbd><span>reset</span>
 </div>
 <div id="legend">
   <span class="swatch">
@@ -729,6 +978,15 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     </svg>
     alloc
   </span>
+  <span class="swatch">
+    <svg width="34" height="14" viewBox="0 0 34 14">
+      <rect x="1" y="2" width="18" height="10" rx="3" ry="3" fill="none"
+            stroke="#C62828" stroke-width="1"/>
+      <text x="20" y="8" fill="#C62828"
+            font-family="Helvetica, sans-serif" font-size="7" font-weight="700">xN</text>
+    </svg>
+    SPMD block num
+  </span>
 </div>
 <div id="stage">
 {svg_body}
@@ -740,6 +998,42 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   if (!svg) return;
   svg.removeAttribute('width');
   svg.removeAttribute('height');
+  const spmdBlocks = {spmd_badges_json};
+  const svgNS = 'http://www.w3.org/2000/svg';
+
+  function svgEl(name, attrs) {{
+    const el = document.createElementNS(svgNS, name);
+    for (const [key, value] of Object.entries(attrs)) {{
+      el.setAttribute(key, value);
+    }}
+    return el;
+  }}
+
+  function addSpmdBadges() {{
+    for (const [nodeId, blocks] of Object.entries(spmdBlocks)) {{
+      const title = Array.from(svg.querySelectorAll('g.node > title')).find((item) => item.textContent === nodeId);
+      if (!title) continue;
+      const group = title.parentElement;
+      const graph = group ? group.parentElement : null;
+      if (!group || !graph || graph.querySelector(`.spmd-badge[data-node-id="${{nodeId}}"]`)) continue;
+
+      const box = group.getBBox();
+      const text = `x${{blocks}}`;
+      const x = box.x + box.width + 1;
+      const y = box.y + box.height / 2 - 3;
+      const badge = svgEl('g', {{ class: 'spmd-badge', 'data-node-id': nodeId }});
+      badge.appendChild(svgEl('title', {{}}));
+      badge.lastChild.textContent = `SPMD block num: ${{blocks}}`;
+
+      badge.appendChild(svgEl('text', {{
+        x, y, fill: '#C62828', 'font-family': 'Helvetica, sans-serif',
+        'font-size': 8, 'font-weight': 700,
+      }}));
+      badge.lastChild.textContent = text;
+      graph.appendChild(badge);
+    }}
+  }}
+  addSpmdBadges();
 
   let scale = 1, tx = 0, ty = 0;
   const apply = () => {{ svg.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`; }};
@@ -799,8 +1093,15 @@ def emit_html(
     annotations=None,
     tensor_table=None,
     task_table=None,
+    show_tensor_info=None,
+    html_edge_style=None,
 ):
     """Build the pan/zoom HTML page: DOT → Graphviz SVG → inline into template."""
+    html_edge_style = html_edge_style or {}
+    hidden_edges = html_edge_style.get("hidden_edges")
+    visible_edge_count = html_edge_style.get("visible_edge_count")
+    if visible_edge_count is None:
+        visible_edge_count = len(edges)
     dot = emit_dot(
         edges,
         nodes,
@@ -809,6 +1110,8 @@ def emit_html(
         annotations=annotations,
         tensor_table=tensor_table,
         task_table=task_table,
+        show_tensor_info=show_tensor_info,
+        hidden_edges=hidden_edges,
     )
     svg_bytes = render_svg(dot, engine=engine)
     svg_text = svg_bytes.decode("utf-8", errors="replace")
@@ -816,8 +1119,9 @@ def emit_html(
         svg_text = svg_text[svg_text.index("<svg") :]
     return _HTML_TEMPLATE.format(
         n_nodes=len(nodes),
-        n_edges=len(edges),
+        n_edges=visible_edge_count,
         svg_body=svg_text,
+        spmd_badges_json=_spmd_badges_json(nodes, task_table),
     )
 
 
@@ -864,6 +1168,8 @@ Examples:
   %(prog)s deps.json --format text -o graph.txt
   %(prog)s deps.json --format html --engine sfdp
   %(prog)s deps.json --format html --show-tensor-info
+  %(prog)s deps.json --edge-mode reduced      # select non-redundant edges, print what was removed
+  %(prog)s deps.json --edge-mode omitted      # select transitively-implied (redundant) edges
 """,
     )
     p.add_argument("input", nargs="?", help="Path to deps.json (default: newest under ./outputs/).")
@@ -873,6 +1179,18 @@ Examples:
         choices=["text", "html"],
         default="text",
         help="Output format: text (default) or html.",
+    )
+    p.add_argument(
+        "--edge-mode",
+        choices=["full", "reduced", "omitted"],
+        default="full",
+        help=(
+            "full (default) selects every dependency edge; reduced applies transitive reduction, selecting the "
+            "minimal edge set; omitted selects only the redundant edges reduced would drop (the complement of "
+            "reduced). reduced/omitted print the redundant edges to stdout, are structural (pred,succ) level, "
+            "apply to both text and html, and are skipped with a warning on a cyclic graph. In html, all edges "
+            "still participate in layout; unselected edges are colored as background."
+        ),
     )
     p.add_argument(
         "--engine",
@@ -940,10 +1258,50 @@ def main(argv=None):
     if meta:
         nodes = sorted(set(nodes) | set(meta.keys()), key=_sort_task_id_key)
 
+    mode_stem = "deps_viewer"
+    hidden_html_edges = set()
+    visible_html_edge_count = len(edges)
+    if args.edge_mode in ("reduced", "omitted"):
+        kept, removed, is_dag = _transitive_reduction(edges, nodes)
+        if not is_dag:
+            print(
+                f"warning: dependency graph has a cycle; transitive reduction skipped, "
+                f"emitting full graph (--edge-mode {args.edge_mode} ignored)",
+                file=sys.stderr,
+            )
+        else:
+            fmt_task = _make_task_formatter(nodes)
+            # reduced keeps the minimal edge set; omitted keeps exactly the
+            # redundant edges that reduced would drop (the two are complements).
+            shown = kept if args.edge_mode == "reduced" else removed
+            if args.edge_mode == "reduced":
+                print(
+                    f"Transitive reduction: removed {len(removed)} redundant edge(s) of {len(edges)} ({len(kept)} kept)"
+                )
+            else:
+                print(f"Redundant edges only: showing {len(removed)} redundant edge(s) of {len(edges)}")
+            for u, v in removed:
+                print(f"  - {fmt_task(u)} -> {fmt_task(v)}")
+            if args.format == "html":
+                hidden_html_edges = set(removed if args.edge_mode == "reduced" else kept)
+                visible_html_edge_count = len(shown)
+                print(
+                    f"HTML layout preserves all {len(edges)} edge(s); "
+                    f"{len(hidden_html_edges)} unselected edge(s) are colored as background"
+                )
+            else:
+                edges = shown
+                # Keep only the annotations of the shown edges so annotated-edge
+                # counts (emit_text summary, the final print) stay consistent with
+                # the rendered edge set instead of counting the hidden ones.
+                shown_set = set(shown)
+                annotations = {k: v for k, v in annotations.items() if k in shown_set}
+            mode_stem = f"deps_viewer_{args.edge_mode}"
+
     out = (
         Path(args.output)
         if args.output
-        else input_path.parent / ("deps_viewer.txt" if args.format == "text" else "deps_viewer.html")
+        else input_path.parent / f"{mode_stem}.{'txt' if args.format == 'text' else 'html'}"
     )
     if args.format == "text":
         text = emit_text(
@@ -972,10 +1330,21 @@ def main(argv=None):
         engine=args.engine,
         annotations=annotations,
         tensor_table=tensor_table,
-        task_table=task_table if args.show_tensor_info else None,
+        task_table=task_table,
+        show_tensor_info=args.show_tensor_info,
+        html_edge_style={
+            "hidden_edges": hidden_html_edges,
+            "visible_edge_count": visible_html_edge_count,
+        },
     )
     out.write_text(html)
-    print(f"Wrote {out} ({len(nodes)} nodes, {len(edges)} edges, engine={args.engine}, format=html)")
+    if hidden_html_edges:
+        print(
+            f"Wrote {out} ({len(nodes)} nodes, {visible_html_edge_count} visible edges, "
+            f"{len(edges)} layout edges, engine={args.engine}, format=html)"
+        )
+    else:
+        print(f"Wrote {out} ({len(nodes)} nodes, {len(edges)} edges, engine={args.engine}, format=html)")
     return 0
 
 

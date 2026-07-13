@@ -32,8 +32,10 @@
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
+#include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
+#include "call_config.h"
 #include "chip_callable_layout.h"
 #include "utils/elf_build_id.h"
 #include "host/host_regs.h"  // Register address retrieval
@@ -56,7 +58,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 }
 
 // =============================================================================
-// Lazy-loaded HAL (ascend_hal) for profiling host-register only
+// Lazy-loaded HAL (ascend_hal) for halHostRegister / halHostUnregister
 // =============================================================================
 
 namespace {
@@ -183,7 +185,12 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
-int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
+    // Latch this run's diagnostic enables onto the runner before the collector
+    // paths below read them; block_dim/aicpu_thread_num are consumed locally.
+    apply_call_config(config);
+    int block_dim = config.block_dim;
+    const int launch_aicpu_num = config.aicpu_thread_num;
     // A prior AICore launch/sync error poisoned the device context and the
     // in-place drain could not clear it. Refuse to run rather than cascade into
     // rtMalloc 507899 / halResMap rc=62 (init_aicore_register_addresses). A soft
@@ -253,15 +260,62 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     // Build the profiling-flag bitfield (a2a3 carries an extra dep_gen bit).
-    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
-    if (enable_dump_tensor_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    if (enable_l2_swimlane_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    if (enable_pmu_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
-    if (enable_dep_gen_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
-    if (enable_scope_stats_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (enable_dump_args_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    if (enable_l2_swimlane_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    if (enable_pmu_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
+    if (enable_dep_gen_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+    if (enable_scope_stats_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;
+
+    // a2a3 onboard now uses the same host-computed, device-filtered affinity
+    // shape as a5. Host probes the AICPU user pool once, chooses the active
+    // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
+    // gate only matches sched_getcpu() against this table.
+    {
+        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
+        std::vector<int32_t> allowed;
+        runtime.set_aicpu_allowed_cpu_count(0);
+        runtime.set_aicpu_launch_count(0);
+        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
+            return -1;
+        }
+        if (!pto::a2a3::compute_allowed_cpus(user_cpus, runtime.get_aicpu_thread_num(), allowed)) {
+            LOG_ERROR(
+                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(),
+                runtime.get_aicpu_thread_num()
+            );
+            return -1;
+        }
+        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
+        if (allowed.size() > cap) {
+            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
+            return -1;
+        }
+        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
+        for (size_t i = 0; i < allowed.size(); ++i)
+            allowed_cpus[i] = allowed[i];
+        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
+        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
+        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+        }
+        runtime.set_aicpu_launch_count(launch_n);
+
+        std::string dump;
+        for (size_t i = 0; i < allowed.size(); ++i) {
+            if (i) dump += ", ";
+            dump += std::to_string(allowed[i]);
+            if (i + 1 == allowed.size()) dump += "(last)";
+        }
+        LOG_INFO_V0(
+            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
+            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
+        );
+    }
 
     auto runtime_args_cleanup = RAIIScopeGuard([this]() {
         kernel_args_.finalize_device_kernel_args();
@@ -270,18 +324,18 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
+        rc = init_l2_swimlane(num_aicore, runtime.get_aicpu_thread_num(), device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
         }
     }
 
-    if (enable_dump_tensor_) {
-        // Initialize tensor dump (independent from profiling)
-        rc = init_tensor_dump(runtime, device_id_);
+    if (enable_dump_args_) {
+        // Initialize args dump (independent from profiling)
+        rc = init_args_dump(runtime, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
         }
     }
@@ -363,7 +417,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_l2_swimlane_ && l2_swimlane_collector_.is_initialized()) {
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
-            core_types[i] = runtime.workers[i].core_type;
+            core_types[i] = runtime.get_workers()[i].core_type;
         }
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
@@ -378,6 +432,19 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // slow-launch / 207001 wedge was measured on a5; this mirror is UNVERIFIED on
     // a2a3 silicon (the dev box is a5-only), relying on CI. See
     // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
+    // The AICore publishes aicore_done on launch (gated by nothing), and the
+    // workers region persists across runs in the pooled arena. Clearing each
+    // worker's aicore_done before the AICore kernel launches keeps the AICPU's
+    // handshake sweep from reading a prior run's report — which would open a
+    // window on that run's physical_core_id. Only aicore_done needs clearing; the
+    // AICore overwrites physical_core_id/core_type in the same report.
+    {
+        Handshake *workers = runtime.get_workers();
+        for (int i = 0; i < num_aicore; i++) {
+            workers[i].aicore_done = 0;
+        }
+    }
+
     LOG_INFO_V0("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
@@ -388,9 +455,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
-    rc = launch_aicpu_kernel(
-        stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
-    );
+    int aicpu_launch_n = (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         // The AICore worker was already launched above and is now spinning in
@@ -448,7 +514,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 }
 
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,
-// `register_callable_host_orch`, `unregister_callable`, `has_callable`,
+// `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 
@@ -462,26 +528,29 @@ void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
     // st_worker pool hands one ChipWorker to every test class on a device),
     // that one error poisons every later test in the xdist worker process.
     //
-    // Try to drain the device so a subsequent run can recover in place. Use
-    // the BOUNDED aclrtSynchronizeDeviceWithTimeout, NOT an unbounded
-    // aclrtSynchronizeStream* on the error-state stream — the latter wedges
-    // subsequent tests (see DeviceRunnerBase::finalize_common's comment on
-    // why finalize deliberately skips a pre-destroy sync). If the bounded
-    // device drain itself errors, the context is unrecoverable without a full
-    // device reset, so mark the runner unusable: run() then fails fast with a
-    // clear message instead of cascading, and finalize() force-resets the card.
-    int sync_rc = aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    // Best-effort BOUNDED drain (aclrtSynchronizeDeviceWithTimeout, NOT an
+    // unbounded aclrtSynchronizeStream* on the error-state stream — the latter
+    // wedges subsequent tests, see DeviceRunnerBase::finalize_common). But DO
+    // NOT gate recovery on the drain's rc: the bounded drain can return success
+    // on a still-poisoned card — a false-negative that left force_reset_device()
+    // untriggered and cascaded into 16 skipped L2 cases on CI run 27742754024
+    // (st-onboard-a2a3 gw3). The op-timeout sticky-error is only cleared by a
+    // force reset (a soft reset/drain does not), so always mark the runner
+    // unusable here: run() fails fast and finalize() force-resets the card, so
+    // the next Worker.init lands clean regardless of what the drain reported.
+    int sync_rc = aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
     if (sync_rc != ACL_SUCCESS) {
         LOG_ERROR(
-            "Device unrecoverable after AICore error %d: aclrtSynchronizeDeviceWithTimeout failed: %d. "
-            "Marking DeviceRunner unusable; run() will fail fast and finalize() will force-reset the "
-            "card (a soft in-process reset does not clear the poison).",
-            aicore_rc, sync_rc
+            "AICore error %d: bounded device drain failed: %d (force reset will follow in finalize)", aicore_rc, sync_rc
         );
-        device_unusable_ = true;
     } else {
-        LOG_WARN("AICore error %d: device drained via aclrtSynchronizeDeviceWithTimeout", aicore_rc);
+        LOG_WARN(
+            "AICore error %d: device drained, but force-resetting in finalize regardless "
+            "(drain success does not prove the card is clean)",
+            aicore_rc
+        );
     }
+    device_unusable_ = true;
 }
 
 namespace {
@@ -550,26 +619,134 @@ private:
 
 }  // namespace
 
-void DeviceRunner::force_reset_device() {
+int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
-        return;
+        return -1;
     }
-    // aclrtResetDeviceForce is an ACL API; bring ACL up and bind the device,
-    // both released on scope exit (LIFO) so a repeated poison-then-reset cycle
-    // in a long-lived process leaks neither ACL state nor a device reference.
+    // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
+    // released on scope exit so a repeated poison-then-reset cycle in a
+    // long-lived process leaks no ACL state.
     AclInitGuard acl_guard;
     if (!acl_guard.ok()) {
+        LOG_ERROR("force_reset_device: ACL init failed; cannot reset device %d", device_id_);
+        return -1;
+    }
+    {
+        // Reset phase. Bind the device, best-effort drain (the op-timeout
+        // sticky-error sometimes settles with a drain first) *inside* this valid
+        // ACL/bound context — finalize() may have already torn ACL down via
+        // aclFinalize/rtDeviceReset, so the drain must live here, not in the
+        // caller — then force-reset. The bind is released at the end of this
+        // block so the probe below holds the only active device reference.
+        DeviceBindGuard bind_guard(device_id_);
+        if (!bind_guard.bound()) {
+            LOG_ERROR("force_reset_device: could not bind device %d; reset skipped", device_id_);
+            return -1;
+        }
+        (void)aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
+        aclError rc = aclrtResetDeviceForce(device_id_);
+        if (rc != ACL_SUCCESS) {
+            LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
+            return static_cast<int>(rc);
+        }
+    }
+    // Post-reset self-check: a 0 rc from aclrtResetDeviceForce does not by itself
+    // prove the card is usable. Re-bind (fresh guard, balanced on exit) and
+    // exercise both poison surfaces — a trivial stream create/destroy (a5 poison:
+    // rtStreamCreate / halResMap) and an HBM alloc/free (a2a3 poison: rtMalloc
+    // 507899) — checking every rc so any failure (incl. the frees) returns
+    // non-zero and finalize() keeps the card flagged for the layer above
+    // (st_worker poison-skip + #1110 dispatcher retry).
+    DeviceBindGuard probe_bind(device_id_);
+    if (!probe_bind.bound()) {
+        LOG_ERROR("force_reset_device: post-reset DeviceBindGuard failed for device %d", device_id_);
+        return -1;
+    }
+    aclrtStream probe_stream = nullptr;
+    aclError stream_rc = aclrtCreateStream(&probe_stream);
+    if (stream_rc != ACL_SUCCESS) {
+        LOG_ERROR(
+            "force_reset_device: post-reset probe aclrtCreateStream on device %d failed: %d (card still poisoned)",
+            device_id_, static_cast<int>(stream_rc)
+        );
+        return static_cast<int>(stream_rc);
+    }
+    aclError destroy_rc = aclrtDestroyStream(probe_stream);
+    if (destroy_rc != ACL_SUCCESS) {
+        LOG_ERROR(
+            "force_reset_device: post-reset probe aclrtDestroyStream on device %d failed: %d", device_id_,
+            static_cast<int>(destroy_rc)
+        );
+        return static_cast<int>(destroy_rc);
+    }
+    void *probe_ptr = nullptr;
+    int probe_rc = rtMalloc(&probe_ptr, 64, RT_MEMORY_HBM, 0);
+    if (probe_rc != 0) {
+        LOG_ERROR(
+            "force_reset_device: post-reset probe rtMalloc on device %d failed: %d (card still poisoned)", device_id_,
+            probe_rc
+        );
+        return probe_rc;
+    }
+    int free_rc = rtFree(probe_ptr);
+    if (free_rc != 0) {
+        LOG_ERROR("force_reset_device: post-reset probe rtFree on device %d failed: %d", device_id_, free_rc);
+        return free_rc;
+    }
+    LOG_WARN(
+        "force_reset_device: aclrtResetDeviceForce(%d) cleared the poisoned card (probe confirmed clean)", device_id_
+    );
+    return 0;
+}
+
+void *DeviceRunner::register_device_memory_to_host(void *dev_ptr, std::size_t bytes) {
+    if (dev_ptr == nullptr || bytes == 0) {
+        return nullptr;
+    }
+    if (device_id_ < 0) {
+        LOG_ERROR("register_device_memory_to_host: invalid device_id %d", device_id_);
+        return nullptr;
+    }
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("register_device_memory_to_host: failed to load ascend_hal: %s", dlerror());
+        return nullptr;
+    }
+    HalHostRegisterFn fn = get_halHostRegister();
+    if (fn == nullptr) {
+        LOG_ERROR("register_device_memory_to_host: halHostRegister symbol not found: %s", dlerror());
+        return nullptr;
+    }
+    void *host_va = nullptr;
+    int rc = fn(dev_ptr, bytes, DEV_SVM_MAP_HOST, device_id_, &host_va);
+    if (rc != 0) {
+        LOG_ERROR("register_device_memory_to_host: halHostRegister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
+        return nullptr;
+    }
+    return host_va;
+}
+
+void DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
+    if (dev_ptr == nullptr) {
         return;
     }
-    DeviceBindGuard bind_guard(device_id_);
-    if (!bind_guard.bound()) {
+    if (device_id_ < 0) {
+        LOG_ERROR("unregister_device_memory_from_host: invalid device_id %d", device_id_);
         return;
     }
-    aclError rc = aclrtResetDeviceForce(device_id_);
-    if (rc != ACL_SUCCESS) {
-        LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
-    } else {
-        LOG_WARN("force_reset_device: aclrtResetDeviceForce(%d) cleared the poisoned card", device_id_);
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("unregister_device_memory_from_host: failed to load ascend_hal: %s", dlerror());
+        return;
+    }
+    // halHostUnregister is keyed by the device pointer; the HAL maps it back to
+    // the host VA internally.
+    HalHostUnregisterFn fn = get_halHostUnregister();
+    if (fn == nullptr) {
+        LOG_ERROR("unregister_device_memory_from_host: halHostUnregister symbol not found: %s", dlerror());
+        return;
+    }
+    int rc = fn(dev_ptr, device_id_);
+    if (rc != 0) {
+        LOG_ERROR("unregister_device_memory_from_host: halHostUnregister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
     }
 }
 
@@ -639,16 +816,50 @@ int DeviceRunner::finalize() {
     // work always holds an exclusive task-submit lock on the card (enforced by
     // .claude/rules/running-onboard.md), and the reset scopes to this card alone,
     // so it cannot disturb other devices/users.
+    int reset_rc = 0;
     if (device_unusable_) {
-        force_reset_device();
+        // Bounded retry: a single force reset normally clears the op-timeout
+        // sticky-error (verified 5/5 on a2a3), but the poison occasionally needs
+        // a drain-then-reset cycle, so retry up to kMaxResetAttempts.
+        // force_reset_device() drains (best-effort) and resets inside its own
+        // ACL/bound scope, and returns 0 only when its post-reset probe confirms
+        // the card is actually clean.
+        constexpr int kMaxResetAttempts = 3;
+        for (int attempt = 1; attempt <= kMaxResetAttempts; ++attempt) {
+            reset_rc = force_reset_device();
+            if (reset_rc == 0) {
+                if (attempt > 1) {
+                    LOG_WARN(
+                        "DeviceRunner finalize: device %d recovered on force-reset attempt %d/%d", device_id_, attempt,
+                        kMaxResetAttempts
+                    );
+                }
+                break;
+            }
+            LOG_ERROR(
+                "DeviceRunner finalize: force-reset attempt %d/%d of device %d did not confirm clean (rc=%d)", attempt,
+                kMaxResetAttempts, device_id_, reset_rc
+            );
+        }
+        if (reset_rc != 0) {
+            LOG_ERROR(
+                "DeviceRunner finalize: device %d still poisoned after %d force-reset attempts; leaving it marked "
+                "unusable so the layer above (st_worker poison-skip + dispatcher retry) recovers it.",
+                device_id_, kMaxResetAttempts
+            );
+        }
     }
 
     device_id_ = -1;
-    // A finalized runner has reset the device; clear the poison flag so a
-    // reused DeviceRunner object (re-init after close) starts clean.
-    device_unusable_ = false;
+    // Clear the poison flag only if the force reset actually recovered the card,
+    // so a still-poisoned card stays flagged: a reused DeviceRunner then fails
+    // run() fast instead of being treated as clean. On the normal (not unusable)
+    // path reset_rc stays 0 and the flag is already false.
+    if (reset_rc == 0) {
+        device_unusable_ = false;
+    }
     LOG_INFO_V0("DeviceRunner finalized");
-    return rc;
+    return rc != 0 ? rc : reset_rc;
 }
 
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
@@ -689,8 +900,8 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
     return 0;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.aicpu_thread_num;
+int DeviceRunner::init_args_dump(Runtime &runtime, int device_id) {
+    int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
@@ -698,7 +909,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
-            LOG_ERROR("Failed to load ascend_hal for tensor dump: %s", dlerror());
+            LOG_ERROR("Failed to load ascend_hal for args dump: %s", dlerror());
             return -1;
         }
         HalHostRegisterFn fn = get_halHostRegister();
@@ -714,7 +925,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     };
 
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_, dump_tensor_level_
+        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_, dump_args_level_
     );
     if (rc != 0) {
         return rc;

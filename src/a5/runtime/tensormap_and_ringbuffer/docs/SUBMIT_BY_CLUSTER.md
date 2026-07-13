@@ -36,7 +36,7 @@ Legacy per-task submit (`kernel_id + worker_type`) cannot express atomic co-disp
 
 Design must preserve the current main runtime architecture:
 
-1. Executor threading split (orchestrator thread vs scheduler threads), and post-orchestrator transition (`transition_requested_` + `reassign_cores_for_all_threads()`).
+1. Executor threading split (orchestrator thread vs scheduler threads); the orchestrator thread exits after the task graph is built while scheduler threads dispatch to completion.
 2. Shared-memory hot/cold split (`PTO2TaskDescriptor` hot + `PTO2TaskPayload` cold).
 
 ## 5. Terminology
@@ -146,10 +146,8 @@ This project-defined flattened numbering is kept unchanged.
 ### 9.2 Cluster Ownership
 
 1. One cluster must be owned by one scheduler domain/thread at a time.
-2. No split-cluster ownership in either:
-   - initial `assign_cores_to_threads()`
-   - post-orchestrator `reassign_cores_for_all_threads()`
-3. Lane occupancy bookkeeping must remain consistent with ownership after reassignment.
+2. No split-cluster ownership in `assign_cores_to_threads()`.
+3. Lane occupancy bookkeeping must remain consistent with ownership.
 
 ## 10. Functional Requirements
 
@@ -165,7 +163,7 @@ This project-defined flattened numbering is kept unchanged.
 1. Validate submit arguments.
 2. Allocate mixed-task ID and initialize descriptor/payload/slot_state once.
 3. Lookup producers via TensorMap; collect fanin metadata and increment producers' `fanout_count`.
-4. Push task to scheduler's wiring queue (scheduler thread 0 asynchronously wires fanout edges and determines readiness).
+4. Wire fanout edges on the orchestrator side and publish ready tasks to the scheduler queues.
 5. Dispatch all active lanes atomically when resources allow.
 6. Aggregate completion and release downstream once.
 

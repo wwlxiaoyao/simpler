@@ -74,16 +74,18 @@ struct Segment {
  */
 struct PTO2TensorMapLayout {
     size_t off_buckets;
+    size_t off_bucket_epochs;
     size_t off_entry_pool;
     size_t off_free_entry_list;
     size_t off_task_entry_heads[PTO2_MAX_RING_DEPTH];
+    size_t off_task_entry_head_epochs[PTO2_MAX_RING_DEPTH];
     int32_t num_buckets;
     int32_t pool_size;
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
 };
 
 // TensorMap Lookup Profiling (must precede inline lookup/insert methods).
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
 extern uint64_t g_lookup_chain_total;
 extern uint64_t g_lookup_count;
 extern int32_t g_lookup_chain_max;
@@ -359,7 +361,8 @@ static_assert(
 struct PTO2TensorMap {
     // Hash table buckets (fixed size, power of 2)
     PTO2TensorMapEntry **buckets;  // Array of offsets into entry_pool (-1 = empty)
-    int32_t num_buckets;           // Must be power of 2 for fast modulo
+    uint32_t *bucket_epochs;
+    int32_t num_buckets;  // Must be power of 2 for fast modulo
 
     // Entry pool as ring buffer
     PTO2TensorMapEntry *entry_pool;        // Ring buffer of entries
@@ -371,7 +374,9 @@ struct PTO2TensorMap {
     // Per-ring per-task entry tracking (for efficient bucket cleanup)
     // Indexed by [ring_id][local_id & (task_window_sizes[ring_id] - 1)]
     PTO2TensorMapEntry **task_entry_heads[PTO2_MAX_RING_DEPTH];
+    uint32_t *task_entry_head_epochs[PTO2_MAX_RING_DEPTH];
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];  // Per-ring task window size (for slot masking)
+    uint32_t current_epoch{1};
 
     // Per-ring validity threshold (for lazy invalidation)
     int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
@@ -384,11 +389,33 @@ struct PTO2TensorMap {
     }
 
     // Accessors read by scope_stats_collector. Declared unconditionally so the
-    // collector .cpp compiles at PTO2_PROFILING=0 (collector is unconditional —
+    // collector .cpp compiles at SIMPLER_DFX=0 (collector is unconditional —
     // setter symbols must export for host dlsym; the probe call sites that use
-    // these accessors stay gated by PTO2_PROFILING).
+    // these accessors stay gated by SIMPLER_DFX).
     int32_t current_used() const { return next_entry_idx - free_num; }
     int32_t pool_capacity() const { return pool_size; }
+    int32_t free_entries() const { return pool_size - current_used(); }
+
+    // Reclaim retired entries across every ring, advancing each ring's cleanup
+    // cursor (last_cleanup[r]) to the supplied watermark. Returns the summed
+    // last_task_alive across rings — the monotone progress signal the
+    // orchestrator's exhaustion back-pressure loop watches to tell a transient
+    // shortage (some ring still retiring tasks) from a wedged pool (no ring
+    // advancing). Idempotent per watermark: a ring whose alive has not passed
+    // last_cleanup[r] is skipped, so it never double-frees.
+    int64_t reclaim_retired_all(const int32_t sm_last_task_alive[PTO2_MAX_RING_DEPTH]) {
+        int64_t alive_sum = 0;
+        for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            int32_t alive = sm_last_task_alive[r];
+            sync_validity(r, alive);
+            if (alive > last_cleanup[r]) {
+                cleanup_retired(r, last_cleanup[r], alive);
+                last_cleanup[r] = alive;
+            }
+            alive_sum += alive;
+        }
+        return alive_sum;
+    }
 
     // new_entry only allocates memory, does not assign attributes
     PTO2TensorMapEntry *new_entry() {
@@ -399,7 +426,6 @@ struct PTO2TensorMap {
         }
         always_assert(next_entry_idx < pool_size);
         PTO2TensorMapEntry *res = &entry_pool[next_entry_idx++];
-        debug_assert(res->bucket_index == -1);
         return res;
     }
 
@@ -457,6 +483,7 @@ struct PTO2TensorMap {
      * a host arena that holds the prebuilt image.
      */
     bool init_data_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena);
+    void reset_for_reuse(const PTO2TensorMapLayout &layout);
 
     /**
      * Phase 3b: write the arena-internal pointer fields. Idempotent;
@@ -496,9 +523,12 @@ struct PTO2TensorMap {
     template <typename Fn>
     void lookup(const Tensor &tensor, Fn &&on_match) {
         uint32_t bucket_index = hash(tensor.buffer.addr);
+        if (bucket_epochs[bucket_index] != current_epoch) {
+            return;
+        }
         PTO2TensorMapEntry *cur_entry = buckets[bucket_index];
 
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
         g_lookup_count++;
         int32_t chain_len = 0;
 #endif
@@ -506,7 +536,7 @@ struct PTO2TensorMap {
         while (cur_entry != nullptr) {
             PTO2TensorMapEntry *next_entry = cur_entry->next_in_bucket;
 
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
             chain_len++;
 #endif
             // Skip stale entries (no chain truncation — entries from different
@@ -521,16 +551,16 @@ struct PTO2TensorMap {
             // Since we hash only by base_ptr, all entries in this bucket have
             // potential to overlap. We must check actual byte-range overlap.
             if (tensor.buffer.addr == cur_entry->buffer_addr) {
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
                 g_lookup_overlap_checks++;
 #endif
                 auto overlap_status = cur_entry->check_overlap(tensor);
                 if (overlap_status != OverlapStatus::NO_OVERLAP) {
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
                     g_lookup_overlap_hits++;
 #endif
                     if (!on_match(*cur_entry, overlap_status)) {
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
                         g_lookup_chain_total += chain_len;
                         if (chain_len > g_lookup_chain_max) g_lookup_chain_max = chain_len;
 #endif
@@ -542,7 +572,7 @@ struct PTO2TensorMap {
             // Move to next entry
             cur_entry = next_entry;
         }
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
         g_lookup_chain_total += chain_len;
         if (chain_len > g_lookup_chain_max) g_lookup_chain_max = chain_len;
 #endif
@@ -576,6 +606,9 @@ struct PTO2TensorMap {
         // Iterate through retired tasks on this ring and remove their entries
         for (int32_t local_id = old_last_task_alive; local_id < new_last_task_alive; local_id++) {
             int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
+            if (task_entry_head_epochs[ring_id][task_slot] != current_epoch) {
+                continue;
+            }
             PTO2TensorMapEntry *cur_entry = task_entry_heads[ring_id][task_slot];
 
             while (cur_entry != nullptr) {
@@ -616,7 +649,7 @@ struct PTO2TensorMap {
      * Link an initialized entry into bucket and task chains.
      */
     void link_entry(PTO2TensorMapEntry *entry, uint64_t addr, PTO2TaskId producer_task_id) {
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
         g_insert_count++;
 #endif
         uint32_t bucket_index = hash(addr);
@@ -627,6 +660,10 @@ struct PTO2TensorMap {
         entry->producer_task_id = producer_task_id;
 
         // Insert at head of hash bucket
+        if (bucket_epochs[bucket_index] != current_epoch) {
+            buckets[bucket_index] = nullptr;
+            bucket_epochs[bucket_index] = current_epoch;
+        }
         entry->bucket_index = bucket_index;
         entry->next_in_bucket = buckets[bucket_index];
         if (entry->next_in_bucket != nullptr) {
@@ -636,6 +673,10 @@ struct PTO2TensorMap {
         entry->prev_in_bucket = nullptr;
 
         // Link to task's entry list
+        if (task_entry_head_epochs[ring_id][task_slot] != current_epoch) {
+            task_entry_heads[ring_id][task_slot] = nullptr;
+            task_entry_head_epochs[ring_id][task_slot] = current_epoch;
+        }
         entry->next_in_task = task_entry_heads[ring_id][task_slot];
         entry->prev_in_task = nullptr;
         if (entry->next_in_task != nullptr) {
@@ -709,7 +750,7 @@ struct PTO2TensorMap {
     void sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_alive);
 };
 
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
 struct PTO2TensorMapProfilingData {
     uint64_t lookup_chain_total;
     uint64_t lookup_count;

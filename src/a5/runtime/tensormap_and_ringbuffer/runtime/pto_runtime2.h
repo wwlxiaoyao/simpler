@@ -67,7 +67,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -87,37 +87,56 @@ struct PTO2RuntimeOps {
     void (*set_tensor_data)(
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
 
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present to keep ops-table layout stable across
-    // PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
+    // SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
 };
 
 /**
- * Layout descriptor for the prebuilt runtime arena. Holds all sub-region
- * offsets (orchestrator / scheduler / sm_handle wrapper / runtime header /
- * AICore mailbox) plus the layout-defining capacities. Produced once on the
- * host by runtime_reserve_layout(); consumed by runtime_init_data_from_layout
- * and runtime_wire_arena_pointers.
+ * Sizing half of the runtime-arena layout: the capacities that *define* the
+ * layout (the input to runtime_reserve_layout). Stable per (callable_id, ring
+ * config); re-read at AICPU boot to reconstruct ring/heap/dep-pool capacities.
  */
-struct PTO2RuntimeArenaLayout {
+struct ArenaSizingKey {
+    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
+    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
+    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
+};
+
+/**
+ * Offset half of the runtime-arena layout: every sub-region offset
+ * (sm_handle wrapper / orchestrator / scheduler / runtime header / AICore
+ * mailbox) plus the committed arena byte size. The *output* of
+ * runtime_reserve_layout; consumed by runtime_init_data_from_layout and
+ * runtime_wire_arena_pointers (the AICPU re-wires arena-internal pointers
+ * from these after rtMemcpy).
+ */
+struct ArenaOffsets {
     size_t off_sm_handle{0};
     PTO2OrchestratorLayout orch;
     PTO2SchedulerLayout sched;
     size_t off_runtime{0};
     size_t off_mailbox{0};
 
-    // Cached parameters (re-used by init_data + wire stages).
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
-    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
-
     // Total arena byte size post-commit. Used by host to size the prebuilt
     // image buffer and as the rtMemcpy length.
     size_t arena_size{0};
+};
+
+/**
+ * Layout descriptor for the prebuilt runtime arena. Two named halves with
+ * distinct lifetimes/semantics: `sizing` is the layout-defining input
+ * (capacities + scheduler timeout), `offsets` is the computed sub-region
+ * offsets + arena size. Produced once on the host by runtime_reserve_layout();
+ * consumed by runtime_init_data_from_layout and runtime_wire_arena_pointers.
+ */
+struct PTO2RuntimeArenaLayout {
+    ArenaSizingKey sizing;
+    ArenaOffsets offsets;
 };
 
 /**
@@ -205,12 +224,13 @@ PTO2Runtime *runtime_init_data_from_layout(
 /**
  * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
  * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
- * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool,
- * wiring.queue}) so each holds arena.base() + offset. Idempotent — runs on
+ * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool})
+ * so each holds arena.base() + offset. Idempotent — runs on
  * both host (writing host-mirror addresses) and AICPU (writing device
  * addresses) sides.
  */
 void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
+bool runtime_reset_for_reuse(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
 
 /**
  * AICPU-only Phase 4 — fill in the few fields the host could not know at

@@ -11,10 +11,12 @@
 
 /**
  * @file profiler_base.h
- * @brief CRTP scaffolding shared by L2Swimlane / Dump / PMU collectors.
+ * @brief CRTP scaffolding shared by L2Swimlane, PMU, DepGen, ArgsDump,
+ *        and ScopeStats collectors.
  *
- * Owns the BufferPoolManager<Module>, the mgmt thread (which polls AICPU
- * ready queues and recycles buffers), and the collector poll thread.
+ * Owns the BufferPoolManager<Module>, drain/replenish mgmt thread(s) that
+ * poll AICPU ready queues and recycle collector-done buffers, and the
+ * collector poll thread(s).
  *
  * Module concept contract
  * -----------------------
@@ -26,7 +28,7 @@
  *   // Types
  *   using DataHeader      = ...;   // Shared-memory header (e.g. L2SwimlaneDataHeader).
  *   using ReadyEntry      = ...;   // Per-AICPU-thread ready-queue entry.
- *   using ReadyBufferInfo = ...;   // Hand-off struct to the collector thread
+ *   using ReadyBufferInfo = ...;   // Hand-off struct to collector thread(s)
  *                                  // (carries dev/host ptrs, optional kind
  *                                  // discriminator, and the seq).
  *   using FreeQueue       = ...;   // Per-instance SPSC queue of free buffer
@@ -34,15 +36,27 @@
  *                                  // `buffer_ptrs[kSlotCount]`.
  *
  *   // Constants
- *   static constexpr int      kBufferKinds;    // L2Swimlane=2 (perf+phase), Dump=1, PMU=1.
+ *   static constexpr int      kBufferKinds;    // L2Swimlane=4, Dump=1, PMU=1.
  *   static constexpr uint32_t kReadyQueueSize; // Per-thread ready-queue depth.
+ *   // Optional: host-side done ring depth (defaults to 1024).
+ *   static constexpr uint32_t kHostPoolQueueSize;
+ *   // Optional: shard-local per-kind recycled ring depth.
+ *   // Defaults to kHostPoolQueueSize.
+ *   static constexpr uint32_t kHostRecycledQueueSize;
  *   static constexpr uint32_t kSlotCount;      // FreeQueue::buffer_ptrs[] length.
  *   static constexpr const char* kSubsystemName; // "PMU" / "L2Swimlane" / "Dump".
+ *   // Optional: number of mgmt drain shards (defaults to 1).
+ *   static constexpr int      kMgmtDrainThreadCount;
+ *   // Optional: number of collector threads / host ready-queue shards.
+ *   static constexpr int      kCollectorThreadCount;
+ *   // Optional: refresh cached queue metadata before a replenish pass.
+ *   template <typename Mgr>
+ *   static void refresh_replenish_metadata(Mgr&, DataHeader*);
  *
  *   // Header pointer cast (host_ptr → DataHeader*)
  *   static DataHeader* header_from_shm(void* shared_mem_host);
  *
- *   // Per-kind alloc batch size for proactive_replenish's batch-alloc fallback.
+ *   // Per-kind alloc batch size for proactive_replenish's free-queue fallback.
  *   static int batch_size(int kind);
  *
  *   // Required only when kBufferKinds > 1: discriminate which recycled bin
@@ -66,16 +80,19 @@
  * Alloc policy
  * ------------
  *
- *   process_entry          replenishes the originating free_queue with EXACTLY
- *                          one buffer per call, matching the 1-in / 1-out
- *                          ratio against the entry the AICPU just produced.
- *                          Single allocation when both recycled and done are
- *                          dry; bounds the per-tick latency.
- *   proactive_replenish    fills to kSlotCount across all instances of every
- *                          kind. When recycled drains it batch-allocates
- *                          `batch_size(kind)` buffers at once to amortize the
- *                          allocator cost — recovery from a double-empty
- *                          condition takes one tick instead of N.
+ *   process_entry          replenishes the originating free_queue from the
+ *                          current drain shard's local recycled pool. It does
+ *                          not allocate on the runtime hot path.
+ *   proactive_replenish    fills to kSlotCount across all instances before
+ *                          drain/collector threads start. If recycled is dry,
+ *                          it allocates one registered block and carves it
+ *                          into a batch of buffers.
+ *   mgmt_replenish_loop    drains collector-done buffers back into recycled
+ *                          lanes and keeps optional per-kind recycled watermarks
+ *                          topped up in batches of max(kSlotCount, gap). It
+ *                          never writes device free_queues, so
+ *                          the drain hot path remains allocation-free and owns
+ *                          all runtime free_queue publication.
  *
  * The above two algorithms live in ProfilerAlgorithms<Module>; Module only
  * supplies the data-access traits above. Implementors must NOT zero `count`
@@ -89,17 +106,16 @@
  *      start(tf) becomes a no-op (shm_host_ stays nullptr).
  *   2. start(tf) — atomically: (a) assembles a MemoryOps from the stashed
  *      callbacks, (b) hands it to the manager via set_memory_context,
- *      (c) launches the mgmt thread, (d) launches the poll thread. Mgmt is
- *      started before poll because mgmt is the only writer to L2 (the
- *      ready_queue) and poll is its sole consumer.
+ *      (c) launches the mgmt thread(s), (d) launches the collector thread(s).
+ *      Mgmt is started before collectors because mgmt is the only writer to
+ *      the host ready queue shard(s) and collectors are their consumers.
  *   3. ... device execution ...
  *   4. stop() — atomically:
- *        a) flips mgmt_running_, joins the mgmt thread; the mgmt thread's
+ *        a) flips mgmt_running_, joins the mgmt thread(s); the drain thread's
  *           final-drain pass pushes the last L1→L2 entries before exiting.
- *        b) execution_complete_ is set; the poll loop sees it on its next
- *           idle tick, drains L2 (which now contains mgmt's final-drain
- *           output), and exits.
- *        c) collector thread joined.
+ *        b) execution_complete_ is set; each collector loop sees it on its
+ *           next idle tick, drains its host ready queue shard, and exits.
+ *        c) collector thread(s) joined.
  *      Caller is then guaranteed L1 and L2 are both empty and all collected
  *      data has been delivered to Derived::on_buffer_collected.
  *
@@ -113,11 +129,11 @@
  *     host shadow at the top of every tick (`mirror_shm_from_device`) and
  *     pushes the few host-modified fields (`queue_heads[q]` after pop,
  *     `free_queue.tail` + `buffer_ptrs[]` after refill) back as narrow
- *     `write_range_to_device` writes. The bulk `mirror_shm_to_device` is
- *     intentionally NOT called from mgmt_loop: it raced with AICPU writes
- *     to device-only fields (current_buf_ptr, total/dropped/mismatch
+ *     `write_range_to_device` writes. A bulk host→device write-back is
+ *     intentionally avoided: it would race with AICPU writes to
+ *     device-only fields (current_buf_ptr, total/dropped/mismatch
  *     counters, queue_tails, free_queue.head, and on a5
- *     L2SwimlaneAicpuPhaseHeader::magic) and rolled them back to the
+ *     L2SwimlaneAicpuPhaseHeader::magic) and roll them back to the
  *     host-shadow values mirrored in at the top of the tick. Buffer
  *     contents are mirrored on demand inside ProfilerAlgorithms.
  *   - On these platforms `reg` always allocates a paired host shadow; the
@@ -135,6 +151,8 @@
  * -------------------------
  *
  *   void on_buffer_collected(const ReadyBufferInfo& info);
+ *   // Optional shard-aware overload:
+ *   void on_buffer_collected(const ReadyBufferInfo& info, int collector_shard);
  *       Copy records out of `info.host_buffer_ptr` and update any
  *       per-collector state. The base class then calls
  *       `manager_.notify_copy_done(...)` so the buffer is recycled —
@@ -146,19 +164,23 @@
  *       (use the subsystem's PLATFORM_*_TIMEOUT_SECONDS).
  *
  *   static constexpr const char*  kSubsystemName;
- *       Used in the idle-timeout log line (e.g. "L2Swimlane", "PMU", "TensorDump").
+ *       Used in the idle-timeout log line (e.g. "L2Swimlane", "PMU", "ArgsDump").
  */
 
 #ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
 #define SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -170,7 +192,30 @@
 
 namespace profiling_common {
 
-// Common subsystem callback signatures. All four collectors (PMU / TensorDump
+template <typename Module, typename = void>
+struct ProfilerModuleDrainThreadCount {
+    static constexpr int value = 1;
+};
+
+template <typename Module>
+struct ProfilerModuleDrainThreadCount<Module, std::void_t<decltype(Module::kMgmtDrainThreadCount)>> {
+    static constexpr int value = Module::kMgmtDrainThreadCount;
+};
+
+template <typename Derived, typename ReadyBufferInfo, typename = void>
+struct ProfilerDerivedShardAwareCollector {
+    static constexpr bool value = false;
+};
+
+template <typename Derived, typename ReadyBufferInfo>
+struct ProfilerDerivedShardAwareCollector<
+    Derived, ReadyBufferInfo,
+    std::void_t<decltype(std::declval<Derived *>()
+                             ->on_buffer_collected(std::declval<const ReadyBufferInfo &>(), std::declval<int>()))>> {
+    static constexpr bool value = true;
+};
+
+// Common subsystem callback signatures. All four collectors (PMU / ArgsDump
 // / L2Swimlane / DepGen) used to declare their own typedefs with identical
 // shapes; these are the canonical types stashed in ProfilerBase via
 // set_memory_context().
@@ -187,16 +232,16 @@ using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 // `default_host_shadow_register` was previously a free function; it has been
 // folded into a lambda inside `ProfilerBase::start()` so the shadow it
 // malloc's can be registered with the manager's `malloc_shadows_` set for
-// safe teardown via `clear_mappings()` / `release_owned_buffers()`. See
+// safe teardown via `clear_mappings()` / `release_all_owned()`. See
 // `ProfilerBase::start()` for the inline definition.
 
 /**
  * RAII scope guard for collector `init()` rollback. On destruction (without
  * `commit()`) it (1) calls `manager.release_all_owned(release_fn)` to free
- * every framework-tracked dev_ptr + host shadow, and (2) releases any extra
- * direct dev_ptrs the collector added via `add_direct_ptr()` (used for
- * pointers the collector owns outside the framework — e.g. PMU per-core
- * `PmuAicoreRing` allocations on a5).
+ * every framework-tracked device allocation and malloc shadow, and (2)
+ * releases any extra direct dev_ptrs the collector added via `add_direct_ptr()`
+ * (used for pointers the collector owns outside the framework — e.g. PMU
+ * per-core `PmuAicoreRing` allocations on a5).
  *
  * Pattern:
  *   int Collector::init(...) {
@@ -307,7 +352,16 @@ struct ProfilerAlgorithms {
     // entry with `read_range_from_device` and skip the pop if the refreshed
     // entry still looks empty — try again next tick.
     template <typename Mgr>
-    static bool try_pop_aicpu_entry(Mgr &mgr, DataHeader *header, int q, ReadyEntry &out) {
+    static bool
+    try_pop_aicpu_entry(Mgr &mgr, DataHeader *header, int q, ReadyEntry &out, bool refresh_indices = false) {
+        if (refresh_indices) {
+            if (mgr.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
+                mgr.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
+                LOG_ERROR("%s: failed to refresh ready_queue indices for thread %d", Module::kSubsystemName, q);
+                return false;
+            }
+            rmb();
+        }
         uint32_t head = header->queue_heads[q];
         uint32_t tail = header->queue_tails[q];
         if (head >= Module::kReadyQueueSize || tail >= Module::kReadyQueueSize) {
@@ -326,26 +380,31 @@ struct ProfilerAlgorithms {
         // race described above. If the entry's `buffer_ptr` is still 0 the
         // producer hasn't finished publishing — treat the queue as empty
         // for this tick.
-        mgr.read_range_from_device(&header->queues[q][head], sizeof(header->queues[q][head]));
+        if (mgr.read_range_from_device(&header->queues[q][head], sizeof(header->queues[q][head])) != 0) {
+            LOG_ERROR("%s: failed to refresh ready_queue entry for thread %d", Module::kSubsystemName, q);
+            return false;
+        }
         rmb();
         out = header->queues[q][head];
         if (out.buffer_ptr == 0) {
             return false;
         }
-        head = (head + 1) % Module::kReadyQueueSize;
-        header->queue_heads[q] = head;
+        uint32_t old_head = head;
+        uint32_t next_head = (head + 1) % Module::kReadyQueueSize;
+        header->queue_heads[q] = next_head;
         wmb();
         // Push the new head value back to device. The bulk mirror_shm_to_device
         // is intentionally not used here — see buffer_pool_manager.h.
-        mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q]));
+        if (mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0) {
+            header->queue_heads[q] = old_head;
+            LOG_ERROR("%s: failed to advance ready_queue head for thread %d", Module::kSubsystemName, q);
+            return false;
+        }
         return true;
     }
 
-    // Refill the originating pool's free_queue with exactly one buffer
-    // (recycled → drain done → alloc), then push the popped buffer's
-    // ReadyBufferInfo to the collector LAST. Skips the push if host_ptr
-    // resolution fails — handing a null pointer to on_buffer_collected
-    // would crash the collector thread.
+    // Refill the originating pool's free_queue from this drain shard's local
+    // recycled pool before handing the full buffer to the collector.
     //
     // a5 specifics: after resolving the popped buffer's host shadow, copy
     // the buffer contents from device to host before delivery. The host
@@ -356,11 +415,6 @@ struct ProfilerAlgorithms {
         if (!site_opt.has_value()) return;
         auto &site = *site_opt;
 
-        void *new_dev = obtain_buffer(mgr, site.kind, site.buffer_size);
-        if (new_dev != nullptr) {
-            push_to_free_queue(mgr, *site.free_queue, new_dev);
-        }
-
         site.info.host_buffer_ptr = mgr.resolve_host_ptr(site.info.dev_buffer_ptr);
         if (site.info.host_buffer_ptr == nullptr) {
             // resolve_host_ptr already logged. Drop rather than deliver null.
@@ -368,46 +422,128 @@ struct ProfilerAlgorithms {
         }
         // a5: pull buffer contents from device into the host shadow before
         // the collector reads `count` and `records[]`.
-        mgr.copy_buffer_from_device(site.info.host_buffer_ptr, site.info.dev_buffer_ptr, site.buffer_size);
+        if (mgr.copy_buffer_from_device(site.info.host_buffer_ptr, site.info.dev_buffer_ptr, site.buffer_size) != 0) {
+            LOG_ERROR(
+                "%s: failed to copy ready buffer from device (kind=%d, thread=%d)", Module::kSubsystemName, site.kind, q
+            );
+            return;
+        }
+        (void)top_up_free_queue(mgr, site.kind, *site.free_queue, site.buffer_size, q);
 
-        mgr.push_to_ready(site.info);
+        if (!mgr.push_to_ready(site.info, q)) {
+            (void)mgr.retire_unqueued_buffer(site.kind, site.info.dev_buffer_ptr, q);
+        }
     }
 
-    // Drain done_queue into recycled, then top up every (kind, instance)
-    // free_queue to kSlotCount. When the recycled pool of a given kind drains
-    // mid-fill, batch-allocate `batch_size(kind)` buffers and continue.
+    // Top up every (kind, instance) free_queue to kSlotCount before worker
+    // threads start. At runtime each drain shard only refills its own lane.
     template <typename Mgr>
-    static void proactive_replenish(Mgr &mgr, DataHeader *header) {
-        mgr.drain_done_into_recycled();
+    static uint64_t proactive_replenish(Mgr &mgr, DataHeader *header) {
+        uint64_t pushed = replenish_free_queues(mgr, header);
+        pushed += replenish_recycled_pools(mgr, header);
+        return pushed;
+    }
+
+    template <typename Mgr>
+    static uint64_t replenish_free_queues(Mgr &mgr, DataHeader *header) {
+        uint64_t pushed = 0;
+        refresh_replenish_metadata(mgr, header, 0);
         Module::for_each_instance(mgr.shared_mem_host(), header, [&](int kind, FreeQueue *fq, size_t buf_size) {
-            top_up_free_queue(mgr, kind, *fq, buf_size);
+            pushed += top_up_free_queue(mgr, kind, *fq, buf_size, /*shard_index=*/-1);
         });
+        return pushed;
+    }
+
+    // Keep shard-local recycled pools above the optional Module watermark.
+    // Used both by startup proactive_replenish and by the runtime replenish
+    // thread. It allocates only into host-side recycled lanes; it does not
+    // touch device free_queues. A small gap still allocates a slot-sized batch
+    // to amortize registration; a large gap is filled in one allocation.
+    template <typename Mgr>
+    static uint64_t replenish_recycled_pools(Mgr &mgr, DataHeader *header) {
+        std::array<size_t, Module::kBufferKinds> buffer_sizes{};
+        Module::for_each_instance(mgr.shared_mem_host(), header, [&](int kind, FreeQueue *, size_t buf_size) {
+            if (kind >= 0 && kind < Module::kBufferKinds && buffer_sizes[static_cast<size_t>(kind)] == 0) {
+                buffer_sizes[static_cast<size_t>(kind)] = buf_size;
+            }
+        });
+
+        uint64_t pushed = 0;
+        for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+            if (buffer_sizes[static_cast<size_t>(kind)] == 0) continue;
+            for (int shard = 0; shard < static_cast<int>(Mgr::kCollectorShardCount); shard++) {
+                size_t target = clamped_recycled_warm_target<Mgr>(kind, shard);
+                if (target == 0) continue;
+                size_t current = mgr.recycled_count(kind, shard);
+                if (current >= target) continue;
+                size_t gap = target - current;
+                size_t batch_count = std::max(static_cast<size_t>(Module::kSlotCount), gap);
+                int batch = batch_count > static_cast<size_t>(std::numeric_limits<int>::max()) ?
+                                std::numeric_limits<int>::max() :
+                                static_cast<int>(batch_count);
+                pushed += mgr.allocate_recycled_batch(kind, buffer_sizes[static_cast<size_t>(kind)], batch, shard);
+            }
+        }
+        return pushed;
     }
 
 private:
-    // Three-level fallback used by process_entry's 1-in/1-out replenish.
-    template <typename Mgr>
-    static void *obtain_buffer(Mgr &mgr, int kind, size_t buf_size) {
-        void *p = mgr.pop_recycled(kind);
-        if (p != nullptr) return p;
-        mgr.drain_done_into_recycled();
-        p = mgr.pop_recycled(kind);
-        if (p != nullptr) return p;
+    static int recycled_warm_target(int kind, int shard) { return recycled_warm_target_impl(kind, shard, 0); }
 
-        void *host_ptr = nullptr;
-        p = mgr.alloc_and_register(buf_size, &host_ptr);
-        if (p == nullptr) {
-            LOG_WARN(
-                "%s: alloc failed for %zu bytes (kind=%d) — increase BUFFERS_PER_* to reduce drops",
-                Module::kSubsystemName, buf_size, kind
-            );
-        }
-        return p;
+    template <typename M = Module>
+    static auto recycled_warm_target_impl(int kind, int shard, int) -> decltype(M::recycled_warm_target(kind, shard)) {
+        return M::recycled_warm_target(kind, shard);
     }
 
-    // Append one buffer pointer to a per-instance free_queue. Caller owns
-    // the "queue is not full" guarantee (process_entry: 1-in/1-out;
-    // top_up_free_queue: explicit fq_used < kSlotCount).
+    template <typename M = Module>
+    static auto recycled_warm_target_impl(int kind, int, long) -> decltype(M::recycled_warm_target(kind)) {
+        return M::recycled_warm_target(kind);
+    }
+
+    static int recycled_warm_target_impl(int, int, ...) { return 0; }
+
+    template <typename Mgr>
+    static size_t clamped_recycled_warm_target(int kind, int shard) {
+        int target = recycled_warm_target(kind, shard);
+        if (target <= 0) return 0;
+        size_t requested = static_cast<size_t>(target);
+        if (requested > Mgr::kRecycledQueueCapacity) {
+            LOG_WARN(
+                "%s: recycled warm target too large for shard=%d kind=%d: target=%zu capacity=%zu; clamping",
+                Module::kSubsystemName, shard, kind, requested, Mgr::kRecycledQueueCapacity
+            );
+            return Mgr::kRecycledQueueCapacity;
+        }
+        return requested;
+    }
+
+    template <typename Mgr, typename M = Module>
+    static auto refresh_replenish_metadata(Mgr &mgr, DataHeader *header, int)
+        -> decltype(M::refresh_replenish_metadata(mgr, header), void()) {
+        M::refresh_replenish_metadata(mgr, header);
+    }
+
+    template <typename Mgr>
+    static void refresh_replenish_metadata(Mgr &, DataHeader *, long) {}
+
+    // Fallback used by drain-shard free_queue top-up.
+    template <typename Mgr>
+    static void *obtain_buffer(Mgr &mgr, int kind, size_t buf_size, int shard_index) {
+        if (shard_index < 0) {
+            if (void *p = mgr.pop_recycled_for_startup(kind); p != nullptr) return p;
+            (void)mgr.allocate_recycled_batch(kind, buf_size, Module::batch_size(kind), shard_index);
+            return mgr.pop_recycled_for_startup(kind);
+        }
+
+        void *p = mgr.pop_recycled(kind, shard_index);
+        if (p != nullptr) return p;
+
+        return nullptr;
+    }
+
+    // Append one buffer pointer to a per-instance free_queue if it has
+    // capacity. The queue owner is the drain shard for that AICPU producer;
+    // proactive_replenish calls this only before drain threads start.
     //
     // a5: write the new slot and the advanced tail back to device via
     // `write_range_to_device` so AICPU sees the refill without us bulk
@@ -415,50 +551,65 @@ private:
     // written before the tail so AICPU never observes a tail update without
     // the corresponding pointer.
     template <typename Mgr>
-    static void push_to_free_queue(Mgr &mgr, FreeQueue &fq, void *dev_ptr) {
-        uint32_t fq_tail = fq.tail;
-        uint32_t slot_idx = fq_tail % Module::kSlotCount;
-        fq.buffer_ptrs[slot_idx] = reinterpret_cast<uint64_t>(dev_ptr);
-        wmb();
-        mgr.write_range_to_device(&fq.buffer_ptrs[slot_idx], sizeof(fq.buffer_ptrs[slot_idx]));
-        fq.tail = fq_tail + 1;
-        wmb();
-        mgr.write_range_to_device(&fq.tail, sizeof(fq.tail));
-    }
-
-    // Fill one (kind, instance) free_queue to kSlotCount, batch-allocating
-    // when the recycled pool of this kind drains mid-fill.
-    template <typename Mgr>
-    static void top_up_free_queue(Mgr &mgr, int kind, FreeQueue &fq, size_t buf_size) {
+    static bool try_push_to_free_queue(Mgr &mgr, FreeQueue &fq, void *dev_ptr) {
+        if (mgr.read_range_from_device(&fq.head, sizeof(fq.head)) != 0) {
+            LOG_ERROR("%s: failed to refresh free_queue head", Module::kSubsystemName);
+            return false;
+        }
         rmb();
         uint32_t fq_head = fq.head;
         uint32_t fq_tail = fq.tail;
-        uint32_t fq_used = fq_tail - fq_head;
-
-        while (fq_used < Module::kSlotCount) {
-            void *new_dev = mgr.pop_recycled(kind);
-            if (new_dev == nullptr) {
-                const int batch = Module::batch_size(kind);
-                for (int i = 0; i < batch; i++) {
-                    void *host_ptr = nullptr;
-                    void *dev = mgr.alloc_and_register(buf_size, &host_ptr);
-                    if (dev == nullptr) break;
-                    mgr.push_recycled(kind, dev);
-                }
-                new_dev = mgr.pop_recycled(kind);
-            }
-            if (new_dev == nullptr) return;
-
-            uint32_t slot_idx = fq_tail % Module::kSlotCount;
-            fq.buffer_ptrs[slot_idx] = reinterpret_cast<uint64_t>(new_dev);
-            wmb();
-            mgr.write_range_to_device(&fq.buffer_ptrs[slot_idx], sizeof(fq.buffer_ptrs[slot_idx]));
-            fq_tail++;
-            fq.tail = fq_tail;
-            wmb();
-            mgr.write_range_to_device(&fq.tail, sizeof(fq.tail));
-            fq_used++;
+        if (fq_tail - fq_head >= Module::kSlotCount) {
+            return false;
         }
+        uint32_t slot_idx = fq_tail % Module::kSlotCount;
+        uint64_t old_slot = fq.buffer_ptrs[slot_idx];
+        fq.buffer_ptrs[slot_idx] = reinterpret_cast<uint64_t>(dev_ptr);
+        wmb();
+        if (mgr.write_range_to_device(&fq.buffer_ptrs[slot_idx], sizeof(fq.buffer_ptrs[slot_idx])) != 0) {
+            fq.buffer_ptrs[slot_idx] = old_slot;
+            LOG_ERROR("%s: failed to publish free_queue slot", Module::kSubsystemName);
+            return false;
+        }
+        fq.tail = fq_tail + 1;
+        wmb();
+        if (mgr.write_range_to_device(&fq.tail, sizeof(fq.tail)) != 0) {
+            fq.tail = fq_tail;
+            fq.buffer_ptrs[slot_idx] = old_slot;
+            LOG_ERROR("%s: failed to publish free_queue tail", Module::kSubsystemName);
+            return false;
+        }
+        return true;
+    }
+
+    template <typename Mgr>
+    static bool free_queue_has_space(Mgr &mgr, FreeQueue &fq) {
+        if (mgr.read_range_from_device(&fq.head, sizeof(fq.head)) != 0) {
+            LOG_ERROR("%s: failed to refresh free_queue head", Module::kSubsystemName);
+            return false;
+        }
+        rmb();
+        return fq.tail - fq.head < Module::kSlotCount;
+    }
+
+    // Fill one (kind, instance) free_queue to kSlotCount. Startup uses any
+    // recycled lane and may batch-allocate; runtime uses only the drain
+    // shard's local recycled lane and returns when it is dry.
+    template <typename Mgr>
+    static uint64_t top_up_free_queue(Mgr &mgr, int kind, FreeQueue &fq, size_t buf_size, int shard_index = 0) {
+        uint64_t pushed = 0;
+
+        while (free_queue_has_space(mgr, fq)) {
+            void *new_dev = obtain_buffer(mgr, kind, buf_size, shard_index);
+            if (new_dev == nullptr) return pushed;
+            if (!try_push_to_free_queue(mgr, fq, new_dev)) {
+                (void)mgr.retire_unqueued_buffer(kind, new_dev, shard_index);
+                LOG_ERROR("%s: failed to return recycled buffer to free_queue", Module::kSubsystemName);
+                return pushed;
+            }
+            pushed++;
+        }
+        return pushed;
     }
 };
 
@@ -530,12 +681,12 @@ public:
 
     /**
      * Assemble a MemoryOps from the callbacks stashed by set_memory_context()
-     * and launch the mgmt + poll threads. If shm_host_ is nullptr (Derived's
+     * and launch the mgmt + collector threads. If shm_host_ is nullptr (Derived's
      * init() aborted before set_memory_context, or finalize() has cleared
      * the context) this is a no-op.
      *
-     * Order matters: mgmt is started before poll because mgmt is the only
-     * writer to L2 (the ready_queue) and poll is its sole consumer. The
+     * Order matters: mgmt is started before collectors because mgmt is the
+     * only writer to L2 (the ready queues) and collectors are the consumers. The
      * register slot defaults to identity on the SVM path (copy_to_device_
      * is null) or to a host-shadow malloc lambda on the non-SVM path
      * (copy_to_device_ installed) — so BufferPoolManager always has a
@@ -588,32 +739,81 @@ public:
         ops.copy_from_device = copy_from_device_;
         manager_.set_memory_context(std::move(ops), shm_dev_, shm_host_, shm_size_, device_id_);
 
-        mgmt_running_.store(true, std::memory_order_release);
-        if (thread_factory) {
-            mgmt_thread_ = thread_factory([this]() {
-                mgmt_loop();
-            });
-        } else {
-            mgmt_thread_ = std::thread(&ProfilerBase::mgmt_loop, this);
+        execution_complete_.store(false, std::memory_order_release);
+        {
+            DataHeader *header = Module::header_from_shm(manager_.shared_mem_host());
+            (void)ProfilerAlgorithms<Module>::proactive_replenish(manager_, header);
         }
 
-        execution_complete_.store(false, std::memory_order_release);
-        if (thread_factory) {
-            collector_thread_ = thread_factory([this]() {
-                poll_and_collect_loop();
-            });
+        constexpr int kDrainThreads = ProfilerModuleDrainThreadCount<Module>::value;
+        constexpr int kCollectorThreads = ProfilerModuleCollectorThreadCount<Module>::value;
+        static_assert(kDrainThreads >= 1, "kMgmtDrainThreadCount must be >= 1");
+        static_assert(kCollectorThreads >= 1, "kCollectorThreadCount must be >= 1");
+        static_assert(
+            kCollectorThreads % kDrainThreads == 0,
+            "SPSC host queues require each collector shard to be fed by one drain thread"
+        );
+
+        mgmt_running_.store(true, std::memory_order_release);
+        {
+            if constexpr (kDrainThreads == 1) {
+                if (thread_factory) {
+                    mgmt_thread_ = thread_factory([this]() {
+                        mgmt_drain_loop(0, 1);
+                    });
+                } else {
+                    mgmt_thread_ = std::thread(&ProfilerBase::mgmt_drain_loop, this, 0, 1);
+                }
+            } else {
+                mgmt_drain_threads_.reserve(kDrainThreads);
+                for (int i = 0; i < kDrainThreads; i++) {
+                    if (thread_factory) {
+                        mgmt_drain_threads_.push_back(thread_factory([this, i]() {
+                            mgmt_drain_loop(i, kDrainThreads);
+                        }));
+                    } else {
+                        mgmt_drain_threads_.emplace_back(&ProfilerBase::mgmt_drain_loop, this, i, kDrainThreads);
+                    }
+                }
+            }
+            if (thread_factory) {
+                mgmt_replenish_thread_ = thread_factory([this]() {
+                    mgmt_replenish_loop();
+                });
+            } else {
+                mgmt_replenish_thread_ = std::thread(&ProfilerBase::mgmt_replenish_loop, this);
+            }
+        }
+
+        if constexpr (kCollectorThreads == 1) {
+            if (thread_factory) {
+                collector_thread_ = thread_factory([this]() {
+                    poll_and_collect_loop(0, 1);
+                });
+            } else {
+                collector_thread_ = std::thread(&ProfilerBase::poll_and_collect_loop, this, 0, 1);
+            }
         } else {
-            collector_thread_ = std::thread(&ProfilerBase::poll_and_collect_loop, this);
+            collector_threads_.reserve(kCollectorThreads);
+            for (int i = 0; i < kCollectorThreads; i++) {
+                if (thread_factory) {
+                    collector_threads_.push_back(thread_factory([this, i]() {
+                        poll_and_collect_loop(i, kCollectorThreads);
+                    }));
+                } else {
+                    collector_threads_.emplace_back(&ProfilerBase::poll_and_collect_loop, this, i, kCollectorThreads);
+                }
+            }
         }
     }
 
     /**
-     * Stop the mgmt thread, drain whatever it pushes during its final pass,
-     * and join the collector. Idempotent. Caller is guaranteed on return
-     * that mgmt's L1 ringbuffer and the host-side L2 ready_queue are both
-     * empty and Derived::on_buffer_collected has been called for every
-     * entry that was in either queue. Framework-owned buffers are NOT freed
-     * here — Derived's finalize() must do that.
+     * Stop the drain/replenish mgmt threads, drain whatever the drain side
+     * pushes during its final pass, and join the collector. Idempotent. Caller
+     * is guaranteed on return that mgmt's L1 ringbuffer and the host-side
+     * ready queue shard(s) are empty and Derived::on_buffer_collected has been
+     * called for every entry that was in either queue. Framework-owned buffers
+     * are NOT freed here — Derived's finalize() must do that.
      *
      * Order matters: stop+join mgmt first so its final-drain pass is fully
      * landed in L2 BEFORE we tell poll to exit. Otherwise mgmt's last batch
@@ -624,10 +824,25 @@ public:
         if (mgmt_thread_.joinable()) {
             mgmt_thread_.join();
         }
+        for (auto &thread : mgmt_drain_threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        mgmt_drain_threads_.clear();
+        if (mgmt_replenish_thread_.joinable()) {
+            mgmt_replenish_thread_.join();
+        }
         execution_complete_.store(true, std::memory_order_release);
         if (collector_thread_.joinable()) {
             collector_thread_.join();
         }
+        for (auto &thread : collector_threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        collector_threads_.clear();
     }
 
     Manager &manager() { return manager_; }
@@ -637,6 +852,7 @@ protected:
     Manager manager_;
     std::atomic<bool> execution_complete_{false};
     std::thread collector_thread_;
+    std::vector<std::thread> collector_threads_;
 
     // Memory context stashed by Derived::init() via set_memory_context().
     // Derived may read these from finalize() / alloc helpers via the
@@ -666,14 +882,16 @@ protected:
      */
     void release_one_buffer(void *dev_ptr, ProfUnregisterCallback unregister_cb, const ProfFreeCallback &free_cb) {
         if (dev_ptr == nullptr) return;
+        void *release_ptr = nullptr;
+        if (!manager_.claim_release_pointer(dev_ptr, &release_ptr)) return;
         if (unregister_cb != nullptr) {
-            int rc = unregister_cb(dev_ptr, device_id_);
+            int rc = unregister_cb(release_ptr, device_id_);
             if (rc != 0) {
-                LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", dev_ptr, rc);
+                LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", release_ptr, rc);
             }
         }
         if (free_cb) {
-            free_cb(dev_ptr);
+            free_cb(release_ptr);
         }
     }
 
@@ -687,8 +905,8 @@ protected:
      *     identity-mapped view of the same memory.
      *   - non-SVM platform (a5):   `copy_to_device_` is installed →
      *     malloc a paired host shadow, zero it, push the zeros to the
-     *     device side. The host shadow lives until release_one_buffer
-     *     `std::free()`s it.
+     *     device side. The host shadow lives until BufferPoolManager teardown
+     *     via `clear_mappings()` or `release_all_owned()`.
      *   - SVM platform (a2a3 sim): `register_cb_` null AND `copy_to_device_`
      *     null → identity-map (host_ptr == dev_ptr).
      *
@@ -744,99 +962,91 @@ protected:
     }
 
 private:
-    /**
-     * mgmt thread main loop. Each tick:
-     *   0) Mirror the device-side shared-memory region (DataHeader + all
-     *      BufferStates) into the host shadow so subsequent reads see the
-     *      latest queue_tails / current_buf_ptr / per-state counters.
-     *   1) Drain done_queue into recycled pools.
-     *   2) Iterate AICPU per-thread ready queues (PLATFORM_MAX_AICPU_THREADS
-     *      upper bound; empty queues are O(1) head==tail checks) and call
-     *      Module::process_entry per entry. process_entry pulls each
-     *      popped buffer's contents from device on demand.
-     *      try_pop_aicpu_entry / push_to_free_queue write the few host-modified
-     *      fields (queue_heads[q], free_queue.tail/buffer_ptrs[]) back to
-     *      device immediately via `write_range_to_device`.
-     *   3) Call Module::proactive_replenish to top up any depleted free
-     *      queues.
-     *   4) Sleep 10 us if no work was done.
-     *
-     * The bulk `mirror_shm_to_device` deliberately is NOT called: it races
-     * with AICPU writes to device-only fields (current_buf_ptr, total/dropped/
-     * mismatch counters, queue_tails, free_queue.head, core_to_thread[],
-     * and on a5 L2SwimlaneAicpuPhaseHeader::magic) and rolls them back to
-     * whatever was mirrored in at the start of the tick. Each host-side
-     * modification is written back as a narrow field write inside Alg.
-     *
-     * On exit (mgmt_running_ → false) it does one final drain pass without
-     * sleeping to flush any straggler entries the device pushed before
-     * stopping.
-     */
-    void mgmt_loop() {
+    void mgmt_drain_loop(int queue_start, int queue_stride) {
         DataHeader *header = Module::header_from_shm(manager_.shared_mem_host());
         using Alg = ProfilerAlgorithms<Module>;
+        constexpr int kIdleBusyPollLoops = 64;
+        int idle_busy_polls = 0;
 
-        while (mgmt_running_.load(std::memory_order_acquire)) {
-            manager_.mirror_shm_from_device();
-
-            manager_.drain_done_into_recycled();
-
+        while (mgmt_running_.load(std::memory_order_relaxed)) {
             bool found_any = false;
-            for (int q = 0; q < PLATFORM_MAX_AICPU_THREADS; q++) {
+            for (int q = queue_start; q < PLATFORM_MAX_AICPU_THREADS; q += queue_stride) {
                 ReadyEntry entry;
-                while (Alg::try_pop_aicpu_entry(manager_, header, q, entry)) {
+                while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
                     Alg::process_entry(manager_, header, q, entry);
                     found_any = true;
                 }
             }
-
-            Alg::proactive_replenish(manager_, header);
+            if (found_any) {
+                idle_busy_polls = 0;
+            }
 
             if (!found_any) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                if (idle_busy_polls < kIdleBusyPollLoops) {
+                    idle_busy_polls++;
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
+                }
             }
         }
 
-        // Final drain after mgmt_running_ flipped: don't sleep, don't
-        // replenish. try_pop_aicpu_entry still pushes the advanced
-        // queue_heads back to device per-pop.
-        manager_.mirror_shm_from_device();
-        for (int q = 0; q < PLATFORM_MAX_AICPU_THREADS; q++) {
+        for (int q = queue_start; q < PLATFORM_MAX_AICPU_THREADS; q += queue_stride) {
             ReadyEntry entry;
-            while (Alg::try_pop_aicpu_entry(manager_, header, q, entry)) {
+            while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
                 Alg::process_entry(manager_, header, q, entry);
             }
         }
     }
 
+    void mgmt_replenish_loop() {
+        DataHeader *header = Module::header_from_shm(manager_.shared_mem_host());
+        using Alg = ProfilerAlgorithms<Module>;
+        while (mgmt_running_.load(std::memory_order_relaxed)) {
+            size_t drained = manager_.drain_done_into_recycled();
+            uint64_t replenished = Alg::replenish_recycled_pools(manager_, header);
+
+            if (drained == 0 && replenished == 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
+        }
+    }
+
     /**
-     * Main collector loop. Blocks on the manager's ready_queue with a 100 ms
+     * Main collector loop. Blocks on one manager ready-queue shard with a 100 ms
      * cv-wait tick. On each hit it dispatches the buffer to Derived via
      * on_buffer_collected() and recycles the buffer. Exits in two cases:
      *
-     *   1. execution_complete_ was set (by stop()) and the ready_queue is
+     *   1. execution_complete_ was set (by stop()) and this ready_queue shard is
      *      empty, after a final non-blocking drain pass.
      *   2. No buffer arrived for `Derived::kIdleTimeoutSec` consecutive
      *      seconds AND execution_complete_ has not been signalled — this
-     *      is a hang detector that logs an error and bails out.
+     *      is a hang detector that logs an error and bails out. Multi-shard
+     *      collectors arm this only after a shard has seen traffic, because
+     *      an empty shard can be a valid run shape.
      */
-    void poll_and_collect_loop() {
+    void poll_and_collect_loop(int shard_index, int shard_count) {
         const auto wait_tick = std::chrono::milliseconds(100);
         const auto idle_timeout = std::chrono::seconds(Derived::kIdleTimeoutSec);
         std::optional<std::chrono::steady_clock::time_point> idle_start;
+        bool has_seen_buffer = false;
 
         while (true) {
             ReadyBufferInfo info;
-            if (manager_.wait_pop_ready(info, wait_tick)) {
-                consume(info);
+            if (manager_.wait_pop_ready(info, wait_tick, shard_index)) {
+                consume(info, shard_index);
+                has_seen_buffer = true;
                 idle_start.reset();
                 continue;
             }
             if (execution_complete_.load(std::memory_order_acquire)) {
-                while (manager_.try_pop_ready(info)) {
-                    consume(info);
+                while (manager_.try_pop_ready(info, shard_index)) {
+                    consume(info, shard_index);
+                    has_seen_buffer = true;
                 }
                 break;
+            }
+            if (shard_count > 1 && !has_seen_buffer) {
+                continue;
             }
             if (!idle_start.has_value()) {
                 idle_start = std::chrono::steady_clock::now();
@@ -851,16 +1061,22 @@ private:
         }
     }
 
-    void consume(const ReadyBufferInfo &info) {
-        static_cast<Derived *>(this)->on_buffer_collected(info);
-        if constexpr (Module::kBufferKinds > 1) {
-            manager_.notify_copy_done(info.dev_buffer_ptr, Module::kind_of(info));
+    void consume(const ReadyBufferInfo &info, int shard_index) {
+        if constexpr (ProfilerDerivedShardAwareCollector<Derived, ReadyBufferInfo>::value) {
+            static_cast<Derived *>(this)->on_buffer_collected(info, shard_index);
         } else {
-            manager_.notify_copy_done(info.dev_buffer_ptr, 0);
+            static_cast<Derived *>(this)->on_buffer_collected(info);
+        }
+        if constexpr (Module::kBufferKinds > 1) {
+            (void)manager_.notify_copy_done(info.dev_buffer_ptr, Module::kind_of(info), shard_index);
+        } else {
+            (void)manager_.notify_copy_done(info.dev_buffer_ptr, 0, shard_index);
         }
     }
 
     std::thread mgmt_thread_;
+    std::vector<std::thread> mgmt_drain_threads_;
+    std::thread mgmt_replenish_thread_;
     std::atomic<bool> mgmt_running_{false};
 };
 

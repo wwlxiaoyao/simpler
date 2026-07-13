@@ -60,20 +60,29 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
 constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
 
 /**
- * AICore op execution timeout (microseconds).
+ * Default AICore op execution timeout (microseconds).
  * Passed to aclrtSetOpExecuteTimeOutV2 so that STARS actively monitors
  * AICore task execution and kills ops that exceed this threshold.
+ * Overridden at runtime by SIMPLER_OP_EXECUTE_TIMEOUT_US when that env var
+ * is valid.
  */
-constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 3000000;  // 3s
+constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 45000000;  // 45s
 
 /**
- * Host-side stream synchronization timeout (milliseconds).
+ * Default onboard AICPU scheduler no-progress timeout (milliseconds).
+ * Shared with host-side timeout ordering validation.
+ */
+constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 10000;
+
+/**
+ * Default host-side stream synchronization timeout (milliseconds).
  * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
  * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US so the host waits for
- * STARS to reap the timed-out op and surface the error, rather than giving up
- * first.
+ * STARS to reap the timed-out op and surface the error, rather than giving
+ * up first. Overridden at runtime by SIMPLER_STREAM_SYNC_TIMEOUT_MS when that
+ * env var is valid.
  */
-constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 4000;  // 4s (> op-exec 3s)
+constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 50000;  // 50s (> op-exec 45s)
 
 // =============================================================================
 // Derived Platform Limits
@@ -114,30 +123,38 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
  * Host dynamically allocates buffers and writes addresses into these slots.
  * Device reads slot addresses when switching buffers.
  * Using slots: provides full pipeline depth for buffer recycling.
- * No runtime rtMalloc — all buffers are pre-allocated and recycled in a closed loop.
+ * Runtime drain never allocates; the host replenish slow path may batch-allocate
+ * registered blocks to keep recycled lanes above their watermarks.
  */
 constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 
 /**
  * L2SwimlaneAicpuTaskBuffer pre-allocation count per AICore.
- * 1 goes into the free_queue at init, the rest into the recycled pool.
+ * Up to PLATFORM_PROF_SLOT_COUNT go into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 
 /**
  * L2SwimlaneAicoreTaskBuffer pre-allocation count per AICore (AICore-as-producer pool).
- * 1 goes into the free_queue at init, the rest into the recycled pool.
+ * Up to PLATFORM_PROF_SLOT_COUNT go into the free_queue at init, the rest into the recycled pool.
  * Mirrors PLATFORM_PROF_BUFFERS_PER_CORE in role; smaller because AICore records
  * are slim (32 B each) and the buffer is also smaller per the rotation design.
  */
 constexpr int PLATFORM_AICORE_BUFFERS_PER_CORE = 4;
 
 /**
- * L2SwimlaneAicpuSchedPhaseBuffer / L2SwimlaneAicpuOrchPhaseBuffer
- * pre-allocation count per AICPU thread (applies independently to both pool
- * kinds). 1 goes into the free_queue at init, the rest into the recycled pool.
+ * Host preallocation count per AICPU thread for the two phase pools, split per
+ * kind (sched vs orch) because their throughput is asymmetric — a single shared
+ * value over-provisions the lighter one. Up to PLATFORM_PROF_SLOT_COUNT buffers
+ * seed the free_queue at init, and the rest seed the recycled pool.
+ *
+ * Floor for both: SLOT_COUNT(4) + 1 = 5 (free_queue fillable + 1 active buffer).
+ * Pure host preallocation — zero ABI (the device-visible ready_queue is decoupled
+ * below, held at the original 16). Sizing rationale + measurements:
+ * docs/dfx/dfx-buffer-capacity-audit.md.
  */
-constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
+constexpr int PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD = 6;
+constexpr int PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD = 8;
 
 /**
  * Ready queue capacity for performance data collection.
@@ -146,10 +163,18 @@ constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
  * over the four buffer kinds (L2SwimlaneAicpuTaskBuffer per core,
  * L2SwimlaneAicpuSchedPhaseBuffer + L2SwimlaneAicpuOrchPhaseBuffer per
  * AICPU thread, L2SwimlaneAicoreTaskBuffer per core).
+ *
+ * The phase term is sized to the ORIGINAL per-thread count (16), decoupled from
+ * PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD, on purpose: this array sizes the
+ * device-visible L2SwimlaneDataHeader::queues[], so shrinking the host
+ * preallocation must NOT shrink it (that would change the shm layout = ABI).
+ * 992 is far above the observed peak backlog (~40); the slack is harmless.
  */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
-                                              2 * PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD +
-                                              PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
+constexpr int PLATFORM_PROF_READYQUEUE_BUFFERS_PER_THREAD = 16;
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
+    PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
+    2 * PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_READYQUEUE_BUFFERS_PER_THREAD +
+    PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
 
 /**
  * System counter frequency (get_sys_cnt)
@@ -168,22 +193,22 @@ inline double cycles_to_us(uint64_t cycles) {
 
 // Profiling-related runtime flags shared through AICPU-AICore handshake.
 // "Profiling" is the umbrella; each bit is a parallel diagnostics sub-feature.
-#define PROFILING_FLAG_NONE 0u
-#define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
-#define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
-#define PROFILING_FLAG_PMU (1u << 2)
-#define PROFILING_FLAG_DEP_GEN (1u << 3)
-#define PROFILING_FLAG_SCOPE_STATS (1u << 4)
-#define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
-#define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
-#define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
+#define SIMPLER_DFX_FLAG_NONE 0u
+#define SIMPLER_DFX_FLAG_DUMP_ARGS (1u << 0)
+#define SIMPLER_DFX_FLAG_L2_SWIMLANE (1u << 1)
+#define SIMPLER_DFX_FLAG_PMU (1u << 2)
+#define SIMPLER_DFX_FLAG_DEP_GEN (1u << 3)
+#define SIMPLER_DFX_FLAG_SCOPE_STATS (1u << 4)
+#define SIMPLER_GET_DFX_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
+#define SIMPLER_SET_DFX_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
+#define SIMPLER_CLEAR_DFX_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
 
 // =============================================================================
-// Tensor Dump Configuration
+// Args Dump Configuration
 // =============================================================================
 
 /**
- * Number of TensorDumpRecord entries per DumpMetaBuffer.
+ * Number of ArgsDumpRecord entries per DumpMetaBuffer.
  * Each record is 128 bytes, so one buffer = RECORDS * 128 bytes.
  */
 constexpr int PLATFORM_DUMP_RECORDS_PER_BUFFER = 256;
@@ -220,7 +245,7 @@ constexpr int PLATFORM_DUMP_MAX_DIMS = 5;
 constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DUMP_BUFFERS_PER_THREAD * 2;
 
 /**
- * Idle timeout duration for tensor dump collection (seconds)
+ * Idle timeout duration for args dump collection (seconds)
  */
 constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 
@@ -240,8 +265,13 @@ constexpr int PLATFORM_PMU_SLOT_COUNT = 4;
 
 /**
  * Pre-allocated PmuBuffer count per AICore.
+ * Sized at 2 = 2× the measured peak in-flight (Little's Law L≈1: PMU records
+ * are produced at the slow fixed sampling rate, decoupled from submit, and the
+ * 64 B record drains instantly, so the host never lets more than 1 buffer be
+ * borrowed). Was 4 (a 4× over-provision). See
+ * docs/dfx/dfx-buffer-capacity-audit.md.
  */
-constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 4;
+constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 2;
 
 /**
  * Ready queue capacity for PMU data collection.
@@ -260,19 +290,49 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is ~2.3 KB (16 Tensor blobs + small header), so a buffer
- * of 32 records is ~74 KB — sized to fit a typical example's submit count
- * (~100-200) in a few buffers.
+ * Each DepGenRecord is 4672 B (16 Tensor blobs + small header), so a buffer
+ * of 1024 records is ~4.6 MB; draining one copies that over SVM.
+ * Guaranteed one-shot capacity = BUFFERS_PER_INSTANCE × RECORDS_PER_BUFFER
+ * records — the size of a back-to-back submit flood the pool absorbs even if
+ * the host never drains. At 4×1024 that is 4096 submits, which aligns
+ * dep_gen's in-flight record count with the scope_stats / l2 AicoreTask pools
+ * (also 4096) per the #977 cross-subsystem review. By in-flight BYTES dep_gen
+ * cannot align (its 4672 B record is 70–90× the others); that tension is
+ * inherent — see docs/dfx/dfx-buffer-capacity-audit.md.
+ * History: original 32 (commit 77ef83c0) → #977 commit 3f977e54 overshot to
+ * 2048 → 1024 here (#977 Primary's actual proposal; the 2× was no gain).
+ * Whether a larger workload drops depends on submit ARRIVAL RATE, not total
+ * count: dep_gen records are produced at submit_task time on the AICPU, so a
+ * dependency-paced workload (real decoder, submits gated by compute) drains
+ * faster than it fills and never drops, while an independent-submit flood
+ * microbenchmark (paged_attention Case1, 65536 back-to-back submits) outruns
+ * host drain. Onboard a2a3: that flood drops ~24576/65536, and the drop is
+ * rate-bound — doubling RECORDS, BUFFERS, or SLOT_COUNT each left it unchanged
+ * (~24576). So buffer sizing is NOT the lever for floods; 4096 in-flight is
+ * sized for the largest realistic single-scope decoder burst (a 4096-submit
+ * burst measured max_ready_depth=1, ample headroom).
+ * dep_gen is opt-in (--enable-dep-gen).
  */
-constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32;
+constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 1024;
 
 /**
  * SPSC free_queue slot count for dep_gen buffers (Host→Device hand-off depth).
+ * Caps how many empty buffers the device can pre-borrow before it starves;
+ * top_up_free_queue refills the ring only up to SLOT_COUNT. Tunable up to 15
+ * within the fixed 128 B DepGenFreeQueue layout (see dep_gen.h), but onboard
+ * tests showed raising it does not reduce flood drops (the drop is rate-bound,
+ * not capacity-bound — see RECORDS_PER_BUFFER above), so it stays at the
+ * default 4.
  */
 constexpr int PLATFORM_DEP_GEN_SLOT_COUNT = 4;
 
 /**
  * Pre-allocated DepGenBuffer count per orchestrator instance.
+ * 4 buffers × 1024 records = 4096 in-flight records (~19 MB per instance).
+ * Must be ≥ SLOT_COUNT to fill the free_queue ring; any beyond SLOT_COUNT seed
+ * the host recycled pool. Raising it does not cut flood drops on its own (the
+ * device is bounded by SLOT_COUNT, and the drop is rate-bound anyway) — see the
+ * RECORDS_PER_BUFFER comment. dep_gen is opt-in (--enable-dep-gen).
  */
 constexpr int PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE = 4;
 
@@ -306,8 +366,13 @@ constexpr int PLATFORM_SCOPE_STATS_SLOT_COUNT = 8;
 
 /**
  * Pre-allocated ScopeStatsBuffer count per orchestrator instance.
+ * Sized at 4 = 4× the measured peak in-flight (Little's Law L≈1: scope_stats
+ * records are produced per scope enter/exit, decoupled from submit volume, and
+ * the 52 B record drains instantly, so the host never lets more than 1 buffer
+ * be borrowed). Was 8 (an 8× over-provision). See
+ * docs/dfx/dfx-buffer-capacity-audit.md.
  */
-constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 8;
+constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 4;
 
 /**
  * Ready queue capacity for scope_stats (per AICPU thread). scope_stats is
